@@ -138,6 +138,7 @@ async function startServer() {
 }
 
 // Rotas da API para o Google Apps Script
+// Rotas da API para o Google Apps Script
 app.get('/api/qr', (req, res) => {
     if (isConnected) return res.json({ status: 'connected', message: 'WhatsApp conectado.' });
     if (qrCodeBase64) return res.json({ status: 'pending', qr: qrCodeBase64 });
@@ -151,6 +152,26 @@ app.post('/api/adicionar-grupo', async (req, res) => {
         const participants = clientesPhones.map(num => `${num.replace(/\D/g, '')}@s.whatsapp.net`);
         const group = await sock.groupCreate(nomeGrupo, participants);
         res.json({ status: 'success', groupId: group.id });
+    } catch (error) {
+        res.status(500).json({ status: 'error', message: error.toString() });
+    }
+});
+
+// ✅ NOVA ROTA: Listar grupos que o bot participa
+app.get('/api/listar-grupos', async (req, res) => {
+    try {
+        if (!isConnected) throw new Error("WhatsApp deslogado.");
+        // Busca todos os grupos no WhatsApp
+        const groups = await sock.groupFetchAllParticipating();
+        
+        // Formata os dados para o front-end
+        const groupList = Object.values(groups).map(g => ({
+            id: g.id,
+            subject: g.subject,
+            participants: g.participants.length
+        }));
+        
+        res.json({ status: 'success', grupos: groupList });
     } catch (error) {
         res.status(500).json({ status: 'error', message: error.toString() });
     }
