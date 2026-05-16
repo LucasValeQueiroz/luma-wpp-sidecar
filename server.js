@@ -1,5 +1,5 @@
 const express = require('express');
-const { default: makeWASocket, DisconnectReason, initAuthCreds } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, DisconnectReason, initAuthCreds, BufferJSON } = require('@whiskeysockets/baileys');
 const { MongoClient } = require('mongodb');
 const qrcode = require('qrcode');
 const pino = require('pino');
@@ -15,17 +15,23 @@ let sock;
 let qrCodeBase64 = '';
 let isConnected = false;
 let mongoCollection; 
+let reconnectTimeout; // Evita disparos múltiplos de reconexão
 
-// Adaptador do MongoDB Corrigido com initAuthCreds()
+// Adaptador do MongoDB profissional usando BufferJSON oficial do Baileys
 async function useMongoDBAuthState(collection) {
-    const writeData = (data, id) => collection.replaceOne({ _id: id }, { _id: id, data: JSON.stringify(data, (k, v) => typeof v === 'bigint' ? v.toString() : v) }, { upsert: true });
+    const writeData = (data, id) => collection.replaceOne(
+        { _id: id }, 
+        { _id: id, data: JSON.stringify(data, BufferJSON.replacer) }, 
+        { upsert: true }
+    );
+    
     const readData = async (id) => {
         const doc = await collection.findOne({ _id: id });
-        return doc ? JSON.parse(doc.data, (k, v) => (typeof v === 'string' && /^\d+n$/.test(v)) ? BigInt(v.slice(0, -1)) : v) : null;
+        return doc ? JSON.parse(doc.data, BufferJSON.reviver) : null;
     };
+    
     const removeData = async (id) => collection.deleteOne({ _id: id });
 
-    // Correção crucial: se não houver dados, usa o gerador oficial do Baileys
     const creds = await readData('creds') || initAuthCreds();
 
     return {
@@ -59,8 +65,18 @@ async function useMongoDBAuthState(collection) {
 }
 
 async function connectToWhatsApp() {
-    console.log('🔄 Inicializando instância do WhatsApp com chaves seguras...');
+    if (reconnectTimeout) clearTimeout(reconnectTimeout);
+    console.log('🔄 Inicializando instância estável do WhatsApp...');
+    
     const { state, saveCreds } = await useMongoDBAuthState(mongoCollection);
+
+    // Remove ouvintes antigos se a instância anterior ainda estiver fechando
+    if (sock) {
+        try {
+            sock.ev.removeAllListeners('connection.update');
+            sock.ev.removeAllListeners('creds.update');
+        } catch (e) { /* silencioso */ }
+    }
 
     sock = makeWASocket({
         auth: state,
@@ -74,7 +90,7 @@ async function connectToWhatsApp() {
         
         if (qr) {
             qrCodeBase64 = await qrcode.toDataURL(qr);
-            console.log('⚡ Novo QR Code gerado com sucesso!');
+            console.log('⚡ QR Code estável gerado e pronto para o Google Apps Script!');
         }
 
         if (connection === 'close') {
@@ -83,18 +99,19 @@ async function connectToWhatsApp() {
             const statusCode = lastDisconnect.error?.output?.statusCode;
             const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
             
-            console.log(`🔴 Conexão fechada (Status: ${statusCode}). Reconectando: ${shouldReconnect}`);
+            console.log(`🔴 Conexão encerrada (Status: ${statusCode}). Agendando reconexão: ${shouldReconnect}`);
             
             if (shouldReconnect) {
-                setTimeout(connectToWhatsApp, 5000); 
+                // Aguarda 7 segundos antes de tentar de novo para dar tempo ao banco de respirar
+                reconnectTimeout = setTimeout(connectToWhatsApp, 7000); 
             } else {
-                console.log('🔴 Desconectado pelo usuário. Limpando banco de dados...');
+                console.log('🔴 Aparelho desconectado pelo usuário. Limpando registros...');
                 await mongoCollection.deleteMany({});
             }
         } else if (connection === 'open') {
             isConnected = true;
             qrCodeBase64 = '';
-            console.log('✅ WhatsApp Autenticado e Pronto!');
+            console.log('✅ WhatsApp TOTALMENTE Autenticado e Pronto!');
         }
     });
 
@@ -103,7 +120,7 @@ async function connectToWhatsApp() {
 
 async function startServer() {
     if (!MONGO_URI) {
-        console.error("❌ ERRO: MONGO_URI não configurada!");
+        console.error("❌ ERRO CRÍTICO: MONGO_URI ausente!");
         return;
     }
 
@@ -111,15 +128,16 @@ async function startServer() {
     await mongoClient.connect();
     const db = mongoClient.db(DBNAME);
     mongoCollection = db.collection(COLLECTION);
-    console.log('📦 Conectado ao MongoDB de forma estável!');
+    console.log('📦 Conectado ao MongoDB com sucesso!');
 
     const PORT = process.env.PORT || 3000;
     app.listen(PORT, () => {
-        console.log(`🚀 Servidor Express na porta ${PORT}`);
+        console.log(`🚀 Servidor Express online na porta ${PORT}`);
         connectToWhatsApp();
     });
 }
 
+// Rotas da API para o Google Apps Script
 app.get('/api/qr', (req, res) => {
     if (isConnected) return res.json({ status: 'connected', message: 'WhatsApp conectado.' });
     if (qrCodeBase64) return res.json({ status: 'pending', qr: qrCodeBase64 });
