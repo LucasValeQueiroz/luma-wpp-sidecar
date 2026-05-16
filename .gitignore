@@ -1,0 +1,16 @@
+# Dependências do Node
+node_modules/
+
+# Logs
+logs
+*.log
+npm-debug.log*
+
+# Ficheiros de ambiente e segurança locais
+.env
+auth_info_groups/
+auth_info_baileys/
+
+# Ficheiros do sistema operativo
+.DS_Store
+Thumbs.db
