@@ -1,5 +1,5 @@
 const express = require('express');
-const { default: makeWASocket, DisconnectReason } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, DisconnectReason, initAuthCreds } = require('@whiskeysockets/baileys');
 const { MongoClient } = require('mongodb');
 const qrcode = require('qrcode');
 const pino = require('pino');
@@ -14,9 +14,9 @@ const COLLECTION = 'auth_info';
 let sock;
 let qrCodeBase64 = '';
 let isConnected = false;
-let mongoCollection; // Variável global para reaproveitar a coleção
+let mongoCollection; 
 
-// Adaptador do MongoDB
+// Adaptador do MongoDB Corrigido com initAuthCreds()
 async function useMongoDBAuthState(collection) {
     const writeData = (data, id) => collection.replaceOne({ _id: id }, { _id: id, data: JSON.stringify(data, (k, v) => typeof v === 'bigint' ? v.toString() : v) }, { upsert: true });
     const readData = async (id) => {
@@ -25,13 +25,8 @@ async function useMongoDBAuthState(collection) {
     };
     const removeData = async (id) => collection.deleteOne({ _id: id });
 
-    const creds = await readData('creds') || {
-        noiseKey: { public: new Uint8Array(32), private: new Uint8Array(32) },
-        signedIdentityKey: { public: new Uint8Array(32), private: new Uint8Array(32) },
-        signedPreKey: { keyPair: { public: new Uint8Array(32), private: new Uint8Array(32) }, signature: new Uint8Array(64), keyId: 1 },
-        registrationId: 0, advSecretKey: "", nextPreKeyId: 1, firstUnuploadedPreKeyId: 1, accountSettings: { unarchiveChats: false },
-        deviceId: "", phoneId: "", identityId: new Uint8Array(20), backupToken: new Uint8Array(20), registered: false
-    };
+    // Correção crucial: se não houver dados, usa o gerador oficial do Baileys
+    const creds = await readData('creds') || initAuthCreds();
 
     return {
         state: {
@@ -64,7 +59,7 @@ async function useMongoDBAuthState(collection) {
 }
 
 async function connectToWhatsApp() {
-    console.log('🔄 Inicializando instância do WhatsApp...');
+    console.log('🔄 Inicializando instância do WhatsApp com chaves seguras...');
     const { state, saveCreds } = await useMongoDBAuthState(mongoCollection);
 
     sock = makeWASocket({
@@ -79,7 +74,7 @@ async function connectToWhatsApp() {
         
         if (qr) {
             qrCodeBase64 = await qrcode.toDataURL(qr);
-            console.log('⚡ Novo QR Code pronto para o Google Apps Script.');
+            console.log('⚡ Novo QR Code gerado com sucesso!');
         }
 
         if (connection === 'close') {
@@ -88,13 +83,12 @@ async function connectToWhatsApp() {
             const statusCode = lastDisconnect.error?.output?.statusCode;
             const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
             
-            console.log(`🔴 Conexão fechada (Motivo: ${statusCode}). Reconectando: ${shouldReconnect}`);
+            console.log(`🔴 Conexão fechada (Status: ${statusCode}). Reconectando: ${shouldReconnect}`);
             
             if (shouldReconnect) {
-                // Reconecta reutilizando a mesma conexão do banco
                 setTimeout(connectToWhatsApp, 5000); 
             } else {
-                console.log('🔴 Desconectado permanentemente. Limpando banco...');
+                console.log('🔴 Desconectado pelo usuário. Limpando banco de dados...');
                 await mongoCollection.deleteMany({});
             }
         } else if (connection === 'open') {
@@ -113,7 +107,6 @@ async function startServer() {
         return;
     }
 
-    // Liga ao Mongo apenas UMA vez no início do servidor
     const mongoClient = new MongoClient(MONGO_URI);
     await mongoClient.connect();
     const db = mongoClient.db(DBNAME);
@@ -127,11 +120,10 @@ async function startServer() {
     });
 }
 
-// Rotas da API
 app.get('/api/qr', (req, res) => {
     if (isConnected) return res.json({ status: 'connected', message: 'WhatsApp conectado.' });
     if (qrCodeBase64) return res.json({ status: 'pending', qr: qrCodeBase64 });
-    res.json({ status: 'starting', message: 'Aguarde, gerando QR Code ou ligando ao banco...' });
+    res.json({ status: 'starting', message: 'Aguarde, gerando QR Code estável...' });
 });
 
 app.post('/api/adicionar-grupo', async (req, res) => {
