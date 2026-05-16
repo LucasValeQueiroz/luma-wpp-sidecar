@@ -1,5 +1,5 @@
 const express = require('express');
-const { default: makeWASocket } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, DisconnectReason } = require('@whiskeysockets/baileys');
 const { MongoClient } = require('mongodb');
 const qrcode = require('qrcode');
 const pino = require('pino');
@@ -7,7 +7,6 @@ const pino = require('pino');
 const app = express();
 app.use(express.json());
 
-// Pega a URL do Banco de Dados pelas variáveis de ambiente do Render
 const MONGO_URI = process.env.MONGO_URI; 
 const DBNAME = 'whatsapp_auth';
 const COLLECTION = 'auth_info';
@@ -15,10 +14,9 @@ const COLLECTION = 'auth_info';
 let sock;
 let qrCodeBase64 = '';
 let isConnected = false;
+let mongoCollection; // Variável global para reaproveitar a coleção
 
-// ---------------------------------------------------------
-// ADAPTADOR: Ensina o Baileys a guardar os dados no MongoDB
-// ---------------------------------------------------------
+// Adaptador do MongoDB
 async function useMongoDBAuthState(collection) {
     const writeData = (data, id) => collection.replaceOne({ _id: id }, { _id: id, data: JSON.stringify(data, (k, v) => typeof v === 'bigint' ? v.toString() : v) }, { upsert: true });
     const readData = async (id) => {
@@ -65,27 +63,14 @@ async function useMongoDBAuthState(collection) {
     };
 }
 
-// ---------------------------------------------------------
-// MOTOR PRINCIPAL DO WHATSAPP
-// ---------------------------------------------------------
-async function startWhatsApp() {
-    if (!MONGO_URI) {
-        console.error("❌ ERRO CRÍTICO: A variável MONGO_URI não foi configurada!");
-        return;
-    }
-
-    const mongoClient = new MongoClient(MONGO_URI);
-    await mongoClient.connect();
-    const db = mongoClient.db(DBNAME);
-    const collection = db.collection(COLLECTION);
-    console.log('📦 Conectado ao MongoDB com sucesso!');
-
-    const { state, saveCreds } = await useMongoDBAuthState(collection);
+async function connectToWhatsApp() {
+    console.log('🔄 Inicializando instância do WhatsApp...');
+    const { state, saveCreds } = await useMongoDBAuthState(mongoCollection);
 
     sock = makeWASocket({
         auth: state,
         printQRInTerminal: true,
-        logger: pino({ level: 'silent' }), // Deixa o terminal limpo
+        logger: pino({ level: 'silent' }),
         syncFullHistory: false
     });
 
@@ -94,55 +79,71 @@ async function startWhatsApp() {
         
         if (qr) {
             qrCodeBase64 = await qrcode.toDataURL(qr);
-            console.log('Novo QR Code gerado, pronto para leitura via API.');
+            console.log('⚡ Novo QR Code pronto para o Google Apps Script.');
         }
 
         if (connection === 'close') {
             isConnected = false;
-            const shouldReconnect = lastDisconnect.error?.output?.statusCode !== 401;
-            console.log('Conexão fechada. Reconectando:', shouldReconnect);
+            qrCodeBase64 = '';
+            const statusCode = lastDisconnect.error?.output?.statusCode;
+            const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+            
+            console.log(`🔴 Conexão fechada (Motivo: ${statusCode}). Reconectando: ${shouldReconnect}`);
+            
             if (shouldReconnect) {
-                startWhatsApp();
+                // Reconecta reutilizando a mesma conexão do banco
+                setTimeout(connectToWhatsApp, 5000); 
             } else {
-                console.log('🔴 Sessão encerrada manualmente. Limpando o banco de dados...');
-                await collection.deleteMany({}); // Apaga os dados se deslogar pelo telemóvel
+                console.log('🔴 Desconectado permanentemente. Limpando banco...');
+                await mongoCollection.deleteMany({});
             }
         } else if (connection === 'open') {
             isConnected = true;
-            qrCodeBase64 = ''; // Limpa o QR
-            console.log('✅ WhatsApp Autenticado e Pronto para Operar!');
+            qrCodeBase64 = '';
+            console.log('✅ WhatsApp Autenticado e Pronto!');
         }
     });
 
     sock.ev.on('creds.update', saveCreds);
 }
 
-// ---------------------------------------------------------
-// ROTAS DO EXPRESS (API PARA O GOOGLE APPS SCRIPT)
-// ---------------------------------------------------------
+async function startServer() {
+    if (!MONGO_URI) {
+        console.error("❌ ERRO: MONGO_URI não configurada!");
+        return;
+    }
 
-// Rota 1: Mostrar o QR Code no seu Painel de Admin
+    // Liga ao Mongo apenas UMA vez no início do servidor
+    const mongoClient = new MongoClient(MONGO_URI);
+    await mongoClient.connect();
+    const db = mongoClient.db(DBNAME);
+    mongoCollection = db.collection(COLLECTION);
+    console.log('📦 Conectado ao MongoDB de forma estável!');
+
+    const PORT = process.env.PORT || 3000;
+    app.listen(PORT, () => {
+        console.log(`🚀 Servidor Express na porta ${PORT}`);
+        connectToWhatsApp();
+    });
+}
+
+// Rotas da API
 app.get('/api/qr', (req, res) => {
-    if (isConnected) return res.json({ status: 'connected', message: 'WhatsApp já está conectado.' });
+    if (isConnected) return res.json({ status: 'connected', message: 'WhatsApp conectado.' });
     if (qrCodeBase64) return res.json({ status: 'pending', qr: qrCodeBase64 });
-    res.json({ status: 'starting', message: 'Aguarde, gerando QR Code ou conectando ao banco de dados...' });
+    res.json({ status: 'starting', message: 'Aguarde, gerando QR Code ou ligando ao banco...' });
 });
 
-// Rota 2: Criar Grupo
 app.post('/api/adicionar-grupo', async (req, res) => {
     const { nomeGrupo, clientesPhones } = req.body; 
     try {
-        if (!isConnected) throw new Error("WhatsApp não está conectado no servidor.");
+        if (!isConnected) throw new Error("WhatsApp deslogado.");
         const participants = clientesPhones.map(num => `${num.replace(/\D/g, '')}@s.whatsapp.net`);
         const group = await sock.groupCreate(nomeGrupo, participants);
-        res.json({ status: 'success', groupId: group.id, message: `Grupo "${nomeGrupo}" criado com sucesso!` });
+        res.json({ status: 'success', groupId: group.id });
     } catch (error) {
         res.status(500).json({ status: 'error', message: error.toString() });
     }
 });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-    console.log(`🚀 Servidor Express rodando na porta ${PORT}`);
-    startWhatsApp();
-});
+startServer();
