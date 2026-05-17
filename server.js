@@ -157,19 +157,33 @@ app.post('/api/adicionar-grupo', async (req, res) => {
     }
 });
 
-// ✅ Listar grupos que o bot participa
+// ✅ Listar grupos que o bot participa (Com filtro de pesquisa)
 app.get('/api/listar-grupos', async (req, res) => {
     try {
         if (!isConnected) throw new Error("WhatsApp deslogado.");
-        // Busca todos os grupos no WhatsApp
+        
+        // Pega o termo de busca enviado na URL
+        const termoBusca = req.query.busca ? req.query.busca.toLowerCase() : '';
+        
+        if (!termoBusca || termoBusca.length < 3) {
+            return res.status(400).json({ status: 'error', message: 'Digite pelo menos 3 letras para buscar.' });
+        }
+
+        // Busca os grupos no WhatsApp
         const groups = await sock.groupFetchAllParticipating();
         
-        // Formata os dados para o front-end
-        const groupList = Object.values(groups).map(g => ({
+        // Formata os dados
+        let groupList = Object.values(groups).map(g => ({
             id: g.id,
             subject: g.subject,
             participants: g.participants.length
         }));
+        
+        // FILTRA os grupos usando o termo de busca (deixando a resposta muito leve)
+        groupList = groupList.filter(g => g.subject && g.subject.toLowerCase().includes(termoBusca));
+        
+        // Limita a 20 resultados para nunca travar o Apps Script
+        groupList = groupList.slice(0, 20);
         
         res.json({ status: 'success', grupos: groupList });
     } catch (error) {
