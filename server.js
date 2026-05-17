@@ -157,7 +157,7 @@ app.post('/api/adicionar-grupo', async (req, res) => {
     }
 });
 
-// ✅ NOVA ROTA: Listar grupos que o bot participa
+// ✅ Listar grupos que o bot participa
 app.get('/api/listar-grupos', async (req, res) => {
     try {
         if (!isConnected) throw new Error("WhatsApp deslogado.");
@@ -173,6 +173,32 @@ app.get('/api/listar-grupos', async (req, res) => {
         
         res.json({ status: 'success', grupos: groupList });
     } catch (error) {
+        res.status(500).json({ status: 'error', message: error.toString() });
+    }
+});
+
+// ✅ Adicionar membros a um grupo JÁ EXISTENTE
+app.post('/api/adicionar-membros-grupo', async (req, res) => {
+    const { groupId, clientesPhones } = req.body; 
+    try {
+        if (!isConnected) throw new Error("WhatsApp deslogado.");
+        if (!groupId || !clientesPhones || clientesPhones.length === 0) {
+            throw new Error("ID do grupo ou lista de contatos ausente.");
+        }
+
+        // Formata os números para o padrão do Baileys/WhatsApp
+        const participants = clientesPhones.map(num => `${String(num).replace(/\D/g, '')}@s.whatsapp.net`);
+        
+        // Função do Baileys para adicionar participantes a um grupo existente
+        const action = await sock.groupParticipantsUpdate(
+            groupId, 
+            participants,
+            "add" // Ação de adicionar
+        );
+        
+        res.json({ status: 'success', action: action });
+    } catch (error) {
+        console.error("Erro ao adicionar membros no grupo:", error);
         res.status(500).json({ status: 'error', message: error.toString() });
     }
 });
