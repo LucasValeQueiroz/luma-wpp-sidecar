@@ -7,6 +7,21 @@ const pino = require('pino');
 const app = express();
 app.use(express.json());
 
+// 🔒 AUTENTICAÇÃO POR TOKEN COMPARTILHADO (x-api-key)
+// Todas as rotas /api exigem o header "x-api-key" igual à variável API_SECRET.
+// Rollout seguro: se API_SECRET NÃO estiver definida no Render, a checagem é ignorada
+// (deixa você fazer o deploy antes de configurar as chaves, sem se trancar do lado de fora).
+const API_SECRET = process.env.API_SECRET;
+app.use('/api', (req, res, next) => {
+    if (!API_SECRET) {
+        console.warn('⚠️ API_SECRET não definida — rotas /api SEM autenticação. Defina a variável no Render para proteger.');
+        return next();
+    }
+    const key = req.get('x-api-key');
+    if (key && key === API_SECRET) return next();
+    return res.status(401).json({ status: 'error', message: 'Não autorizado (x-api-key inválida ou ausente).' });
+});
+
 const MONGO_URI = process.env.MONGO_URI;
 const DBNAME = 'whatsapp_auth';
 const COLLECTION = 'auth_info';
@@ -228,15 +243,31 @@ app.get('/api/grupo-participantes', async (req, res) => {
 
         // groupMetadata devolve a lista completa de participantes do grupo
         const meta = await sock.groupMetadata(groupId);
-        const participantes = (meta.participants || []).map(p => ({
-            number: String(p.id || '').replace(/@.*/, ''), // só os dígitos do telefone
-            admin: p.admin || null                          // 'admin' | 'superadmin' | null
-        })).filter(p => p.number && /^\d+$/.test(p.number)); // remove @lid / entradas inválidas
+
+        // No Baileys v7 os grupos usam LID: p.id vem como "@lid" (identificador de privacidade),
+        // e o TELEFONE REAL fica em p.phoneNumber (formato PN, "@s.whatsapp.net").
+        // Priorizamos phoneNumber; se não houver, tentamos p.id caso ele já seja um telefone.
+        const participantes = [];
+        let naoResolvidos = 0;
+
+        (meta.participants || []).forEach(p => {
+            let pnJid = p.phoneNumber || (String(p.id || '').endsWith('@s.whatsapp.net') ? p.id : '');
+            const number = String(pnJid || '').replace(/@.*/, '').replace(/\D/g, '');
+
+            // Telefone válido: 8 a 15 dígitos (E.164). LIDs têm ~15+ dígitos e não têm DDI válido,
+            // mas como já filtramos por phoneNumber, o que sobra aqui são telefones reais.
+            if (number && /^\d{8,15}$/.test(number)) {
+                participantes.push({ number: number, admin: p.admin || null });
+            } else {
+                naoResolvidos++; // participante sem telefone sincronizado (só LID disponível)
+            }
+        });
 
         res.json({
             status: 'success',
             subject: meta.subject || '',
             total: participantes.length,
+            naoResolvidos: naoResolvidos,
             participantes: participantes
         });
     } catch (error) {
