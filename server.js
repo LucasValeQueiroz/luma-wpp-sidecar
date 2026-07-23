@@ -7,29 +7,29 @@ const pino = require('pino');
 const app = express();
 app.use(express.json());
 
-const MONGO_URI = process.env.MONGO_URI; 
+const MONGO_URI = process.env.MONGO_URI;
 const DBNAME = 'whatsapp_auth';
 const COLLECTION = 'auth_info';
 
 let sock;
 let qrCodeBase64 = '';
 let isConnected = false;
-let mongoCollection; 
+let mongoCollection;
 let reconnectTimeout; // Evita disparos múltiplos de reconexão
 
 // Adaptador do MongoDB profissional usando BufferJSON oficial do Baileys
 async function useMongoDBAuthState(collection) {
     const writeData = (data, id) => collection.replaceOne(
-        { _id: id }, 
-        { _id: id, data: JSON.stringify(data, BufferJSON.replacer) }, 
+        { _id: id },
+        { _id: id, data: JSON.stringify(data, BufferJSON.replacer) },
         { upsert: true }
     );
-    
+
     const readData = async (id) => {
         const doc = await collection.findOne({ _id: id });
         return doc ? JSON.parse(doc.data, BufferJSON.reviver) : null;
     };
-    
+
     const removeData = async (id) => collection.deleteOne({ _id: id });
 
     const creds = await readData('creds') || initAuthCreds();
@@ -67,7 +67,7 @@ async function useMongoDBAuthState(collection) {
 async function connectToWhatsApp() {
     if (reconnectTimeout) clearTimeout(reconnectTimeout);
     console.log('🔄 Inicializando instância estável do WhatsApp...');
-    
+
     const { state, saveCreds } = await useMongoDBAuthState(mongoCollection);
 
     // Remove ouvintes antigos se a instância anterior ainda estiver fechando
@@ -87,7 +87,7 @@ async function connectToWhatsApp() {
 
     sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect, qr } = update;
-        
+
         if (qr) {
             qrCodeBase64 = await qrcode.toDataURL(qr);
             console.log('⚡ QR Code estável gerado e pronto para o Google Apps Script!');
@@ -98,12 +98,12 @@ async function connectToWhatsApp() {
             qrCodeBase64 = '';
             const statusCode = lastDisconnect.error?.output?.statusCode;
             const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
-            
+
             console.log(`🔴 Conexão encerrada (Status: ${statusCode}). Agendando reconexão: ${shouldReconnect}`);
-            
+
             if (shouldReconnect) {
                 // Aguarda 7 segundos antes de tentar de novo para dar tempo ao banco de respirar
-                reconnectTimeout = setTimeout(connectToWhatsApp, 7000); 
+                reconnectTimeout = setTimeout(connectToWhatsApp, 7000);
             } else {
                 console.log('🔴 Aparelho desconectado pelo usuário. Limpando registros...');
                 await mongoCollection.deleteMany({});
@@ -138,7 +138,6 @@ async function startServer() {
 }
 
 // Rotas da API para o Google Apps Script
-// Rotas da API para o Google Apps Script
 app.get('/api/qr', (req, res) => {
     if (isConnected) return res.json({ status: 'connected', message: 'WhatsApp conectado.' });
     if (qrCodeBase64) return res.json({ status: 'pending', qr: qrCodeBase64 });
@@ -146,7 +145,7 @@ app.get('/api/qr', (req, res) => {
 });
 
 app.post('/api/adicionar-grupo', async (req, res) => {
-    const { nomeGrupo, clientesPhones } = req.body; 
+    const { nomeGrupo, clientesPhones } = req.body;
     try {
         if (!isConnected) throw new Error("WhatsApp deslogado.");
         const participants = clientesPhones.map(num => `${num.replace(/\D/g, '')}@s.whatsapp.net`);
@@ -161,30 +160,30 @@ app.post('/api/adicionar-grupo', async (req, res) => {
 app.get('/api/listar-grupos', async (req, res) => {
     try {
         if (!isConnected) throw new Error("WhatsApp deslogado.");
-        
+
         // Pega o termo de busca enviado na URL
         const termoBusca = req.query.busca ? req.query.busca.toLowerCase() : '';
-        
+
         if (!termoBusca || termoBusca.length < 3) {
             return res.status(400).json({ status: 'error', message: 'Digite pelo menos 3 letras para buscar.' });
         }
 
         // Busca os grupos no WhatsApp
         const groups = await sock.groupFetchAllParticipating();
-        
+
         // Formata os dados
         let groupList = Object.values(groups).map(g => ({
             id: g.id,
             subject: g.subject,
             participants: g.participants.length
         }));
-        
+
         // FILTRA os grupos usando o termo de busca (deixando a resposta muito leve)
         groupList = groupList.filter(g => g.subject && g.subject.toLowerCase().includes(termoBusca));
-        
+
         // Limita a 20 resultados para nunca travar o Apps Script
         groupList = groupList.slice(0, 20);
-        
+
         res.json({ status: 'success', grupos: groupList });
     } catch (error) {
         res.status(500).json({ status: 'error', message: error.toString() });
@@ -193,7 +192,7 @@ app.get('/api/listar-grupos', async (req, res) => {
 
 // ✅ Adicionar membros a um grupo JÁ EXISTENTE
 app.post('/api/adicionar-membros-grupo', async (req, res) => {
-    const { groupId, clientesPhones } = req.body; 
+    const { groupId, clientesPhones } = req.body;
     try {
         if (!isConnected) throw new Error("WhatsApp deslogado.");
         if (!groupId || !clientesPhones || clientesPhones.length === 0) {
@@ -202,17 +201,68 @@ app.post('/api/adicionar-membros-grupo', async (req, res) => {
 
         // Formata os números para o padrão do Baileys/WhatsApp
         const participants = clientesPhones.map(num => `${String(num).replace(/\D/g, '')}@s.whatsapp.net`);
-        
+
         // Função do Baileys para adicionar participantes a um grupo existente
         const action = await sock.groupParticipantsUpdate(
-            groupId, 
+            groupId,
             participants,
             "add" // Ação de adicionar
         );
-        
+
         res.json({ status: 'success', action: action });
     } catch (error) {
         console.error("Erro ao adicionar membros no grupo:", error);
+        res.status(500).json({ status: 'error', message: error.toString() });
+    }
+});
+
+// ✅ NOVA ROTA: Buscar os participantes (números) de um grupo específico
+// Usada pelo painel para importar os membros do grupo para a aba "Contatos".
+app.get('/api/grupo-participantes', async (req, res) => {
+    try {
+        if (!isConnected) throw new Error("WhatsApp deslogado.");
+        const groupId = req.query.groupId;
+        if (!groupId) {
+            return res.status(400).json({ status: 'error', message: 'groupId ausente.' });
+        }
+
+        // groupMetadata devolve a lista completa de participantes do grupo
+        const meta = await sock.groupMetadata(groupId);
+        const participantes = (meta.participants || []).map(p => ({
+            number: String(p.id || '').replace(/@.*/, ''), // só os dígitos do telefone
+            admin: p.admin || null                          // 'admin' | 'superadmin' | null
+        })).filter(p => p.number && /^\d+$/.test(p.number)); // remove @lid / entradas inválidas
+
+        res.json({
+            status: 'success',
+            subject: meta.subject || '',
+            total: participantes.length,
+            participantes: participantes
+        });
+    } catch (error) {
+        console.error("Erro ao buscar participantes do grupo:", error);
+        res.status(500).json({ status: 'error', message: error.toString() });
+    }
+});
+
+// ✅ NOVA ROTA: Enviar mensagem (texto + imagem opcional) para um grupo
+// Usada pelos disparos de catálogo. Aceita { groupId, message, imageUrl? }.
+app.post('/api/enviar-grupo', async (req, res) => {
+    const { groupId, message, imageUrl } = req.body;
+    try {
+        if (!isConnected) throw new Error("WhatsApp deslogado.");
+        if (!groupId) throw new Error("groupId ausente.");
+
+        if (imageUrl) {
+            await sock.sendMessage(groupId, { image: { url: imageUrl }, caption: message || '' });
+        } else {
+            if (!message) throw new Error("Mensagem vazia.");
+            await sock.sendMessage(groupId, { text: message });
+        }
+
+        res.json({ status: 'success' });
+    } catch (error) {
+        console.error("Erro ao enviar mensagem para o grupo:", error);
         res.status(500).json({ status: 'error', message: error.toString() });
     }
 });
