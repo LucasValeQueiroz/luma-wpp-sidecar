@@ -1,15 +1,31 @@
 {
   "name": "luma-wpp-sidecar",
-  "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
-  "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
-  },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
+  "version": "2.0.0",
+  "description": "Microserviço Node.js que estende o CRM Luma: gestão de grupos de WhatsApp via Baileys, escuta seletiva de grupos de fornecedores (entrada de estoque) e publicação de catálogo em grupos de clientes (saída).",
+  "main": "server.js",
   "type": "commonjs",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "test": "echo \"Sem testes automatizados neste serviço\" && exit 0"
+  },
+  "keywords": [
+    "whatsapp",
+    "baileys",
+    "sidecar",
+    "crm",
+    "grupos",
+    "estoque"
+  ],
+  "author": "Lucas Vale Queiroz",
+  "license": "ISC",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/LucasValeQueiroz/luma-wpp-sidecar.git"
+  },
   "dependencies": {
     "@whiskeysockets/baileys": "^7.0.0-rc11",
     "express": "^5.2.1",

@@ -1,16 +1,14 @@
-# Dependências do Node
-node_modules/
-
-# Logs
-logs
-*.log
-npm-debug.log*
-
-# Ficheiros de ambiente e segurança locais
+# Segredos — NUNCA commitar.
+# Um .env vazado dá a qualquer pessoa a sessão do seu WhatsApp e o seu banco.
 .env
-auth_info_groups/
-auth_info_baileys/
+.env.*
+*.pem
+*.key
 
-# Ficheiros do sistema operativo
+# Sessão local do Baileys (em produção ela vive no MongoDB)
+auth_info*/
+baileys_store*
+
+node_modules/
+npm-debug.log*
 .DS_Store
-Thumbs.db
