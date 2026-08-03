@@ -71,6 +71,9 @@ let mongoCollection;
 let colEntradaCfg;
 let colEntradaFila;
 let reconnectTimeout;
+let conectando = false;             // trava contra reconexões sobrepostas
+let inicioTentativaConexao = 0;     // usado pelo watchdog e pelo diagnóstico
+let ultimoMotivoQueda = '';         // código da última desconexão, para o painel
 
 // Cache em memória da configuração de entrada — evita ir ao Mongo a cada mensagem.
 let entradaCfg = { webhookUrl: '', secret: '', grupos: [] };
@@ -117,6 +120,21 @@ function apiKeyGuard(req, res, next) {
     }
     next();
 }
+/**
+ * ROTA PÚBLICA DE PING — de propósito fora do /api e sem autenticação.
+ *
+ * O plano gratuito do Render hiberna o serviço após ~15 minutos sem tráfego, e
+ * acordar leva de 30 a 60 segundos. Pior: cada hibernação derruba a sessão do
+ * WhatsApp e obriga uma reconexão.
+ *
+ * Aponte um monitor de uptime gratuito (UptimeRobot, Better Stack, cron-job.org)
+ * para https://SEU-APP.onrender.com/ping a cada 10 minutos e o serviço nunca
+ * dorme. Não devolve nada sensível: só se está vivo e se o WhatsApp está pareado.
+ */
+app.get('/ping', (req, res) => {
+    res.json({ ok: true, conectado: isConnected });
+});
+
 app.use('/api', apiKeyGuard);
 
 // =====================================================================
@@ -380,8 +398,31 @@ async function tratarMensagemDeGrupo(msg) {
 // =====================================================================
 async function connectToWhatsApp() {
     if (reconnectTimeout) clearTimeout(reconnectTimeout);
+
+    // Trava contra reconexões sobrepostas: o watchdog e o connection.update podem
+    // disparar quase juntos, e dois sockets ao mesmo tempo derrubam um ao outro.
+    if (conectando) {
+        console.log('⏭️ Já existe uma conexão em andamento — ignorando chamada duplicada.');
+        return;
+    }
+    conectando = true;
+    inicioTentativaConexao = Date.now();
     console.log('🔄 Inicializando instância estável do WhatsApp...');
 
+    try {
+        await conectarInterno();
+    } catch (e) {
+        // Se o makeWASocket estourar, nenhum listener chega a existir e o serviço
+        // ficaria mudo para sempre. Aqui garantimos uma nova tentativa.
+        console.error('❌ Falha ao iniciar o socket:', e.message);
+        ultimoMotivoQueda = 'erro ao iniciar: ' + e.message;
+        reconnectTimeout = setTimeout(connectToWhatsApp, 15000);
+    } finally {
+        conectando = false;
+    }
+}
+
+async function conectarInterno() {
     const { state, saveCreds } = await useMongoDBAuthState(mongoCollection);
 
     if (sock) {
@@ -414,19 +455,29 @@ async function connectToWhatsApp() {
             isConnected = false;
             qrCodeBase64 = '';
             const statusCode = lastDisconnect?.error?.output?.statusCode;
-            const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+            ultimoMotivoQueda = String(statusCode || 'desconhecido');
+            const deslogado = statusCode === DisconnectReason.loggedOut;
 
-            console.log(`🔴 Conexão encerrada (Status: ${statusCode}). Agendando reconexão: ${shouldReconnect}`);
+            console.log(`🔴 Conexão encerrada (Status: ${statusCode}). Deslogado: ${deslogado}`);
 
-            if (shouldReconnect) {
-                reconnectTimeout = setTimeout(connectToWhatsApp, 7000);
-            } else {
-                console.log('🔴 Aparelho desconectado pelo usuário. Limpando registros...');
+            if (deslogado) {
+                // 🐞 BUG HISTÓRICO CORRIGIDO AQUI:
+                // a versão anterior limpava a sessão e PARAVA — nunca chamava
+                // connectToWhatsApp() de novo. Resultado: `isConnected` ficava false
+                // e `qrCodeBase64` ficava vazio para sempre, então /api/qr respondia
+                // "starting" eternamente e o painel girava em looping sem nunca
+                // mostrar QR. Só um restart manual no Render resolvia.
+                console.log('🧹 Sessão inválida/deslogada. Limpando e gerando QR novo...');
                 await mongoCollection.deleteMany({});
             }
+
+            // Em QUALQUER caso reconectamos: se foi queda, para restaurar;
+            // se foi logout, para emitir um QR Code novo.
+            reconnectTimeout = setTimeout(connectToWhatsApp, deslogado ? 3000 : 7000);
         } else if (connection === 'open') {
             isConnected = true;
             qrCodeBase64 = '';
+            ultimoMotivoQueda = '';
             console.log('✅ WhatsApp TOTALMENTE Autenticado e Pronto!');
         }
     });
@@ -450,7 +501,17 @@ async function connectToWhatsApp() {
 app.get('/api/qr', (req, res) => {
     if (isConnected) return res.json({ status: 'connected', message: 'WhatsApp conectado.' });
     if (qrCodeBase64) return res.json({ status: 'pending', qr: qrCodeBase64 });
-    res.json({ status: 'starting', message: 'Aguarde, gerando QR Code estável...' });
+
+    // Diagnóstico honesto: em vez de repetir "aguarde" para sempre, dizemos há
+    // quanto tempo estamos tentando e qual foi o último motivo de queda.
+    const seg = inicioTentativaConexao ? Math.round((Date.now() - inicioTentativaConexao) / 1000) : 0;
+    let msg = 'Aguarde, gerando QR Code estável...';
+    if (seg > 90) {
+        msg = `Tentando conectar há ${seg}s sem sucesso` +
+              (ultimoMotivoQueda ? ` (última queda: ${ultimoMotivoQueda})` : '') +
+              '. Use "Apagar sessão e gerar QR novo".';
+    }
+    res.json({ status: 'starting', message: msg, tentandoHaSegundos: seg, ultimoMotivoQueda: ultimoMotivoQueda });
 });
 
 app.get('/api/health', (req, res) => {
@@ -626,6 +687,36 @@ app.get('/api/config-entrada', async (req, res) => {
     });
 });
 
+/**
+ * Apaga a sessão salva no Mongo e reconecta do zero, forçando um QR Code novo.
+ *
+ * Serve para o caso em que a sessão gravada está corrompida ou foi desconectada
+ * pelo celular: o Baileys fica tentando restaurar em looping e nunca emite nem
+ * 'open' nem 'qr', então o painel trava eternamente em "iniciando".
+ *
+ * Depois de chamar isto, o aparelho antigo perde o pareamento — é preciso
+ * escanear o QR de novo.
+ */
+app.post('/api/resetar-sessao', async (req, res) => {
+    try {
+        console.log('♻️ Reset de sessão solicitado pelo painel.');
+
+        try { if (sock) sock.ev.removeAllListeners('connection.update'); } catch (e) { /* ignora */ }
+        try { if (sock) await sock.logout(); } catch (e) { /* a sessão já podia estar inválida */ }
+
+        await mongoCollection.deleteMany({});
+        isConnected = false;
+        qrCodeBase64 = '';
+
+        // Pequena folga para o socket antigo terminar de fechar antes de subir o novo.
+        setTimeout(connectToWhatsApp, 2000);
+
+        res.json({ status: 'success', message: 'Sessão apagada. Um QR Code novo será gerado em alguns segundos.' });
+    } catch (error) {
+        res.status(500).json({ status: 'error', message: error.toString() });
+    }
+});
+
 // Reenvia manualmente o que estiver preso na fila.
 app.post('/api/reprocessar-fila', async (req, res) => {
     try {
@@ -671,6 +762,20 @@ async function startServer() {
 
         connectToWhatsApp();
         setInterval(processarFilaPendente, 60 * 1000);   // worker da fila de reenvio
+
+        // 🐕 WATCHDOG: rede de segurança final.
+        // Se por qualquer motivo ficarmos 2 minutos sem estar conectados E sem QR
+        // na mão, algo travou no meio do caminho — força uma nova tentativa.
+        // Sem isto, um único evento perdido deixava o serviço mudo até alguém
+        // reiniciar o Render na mão.
+        setInterval(() => {
+            if (isConnected || qrCodeBase64 || conectando) return;
+            const parado = Date.now() - (inicioTentativaConexao || 0);
+            if (parado > 120000) {
+                console.warn(`🐕 Watchdog: ${Math.round(parado / 1000)}s sem conexão e sem QR. Reiniciando o socket...`);
+                connectToWhatsApp();
+            }
+        }, 30 * 1000);
     });
 }
 

@@ -2,6 +2,11 @@
 # Um .env vazado dá a qualquer pessoa a sessão do seu WhatsApp e o seu banco.
 .env
 .env.*
+
+# Exceção: o .env.example é só um MODELO, sem valor real nenhum.
+# Sem esta linha o padrão ".env.*" acima o bloquearia junto com os de verdade.
+!.env.example
+
 *.pem
 *.key
 
