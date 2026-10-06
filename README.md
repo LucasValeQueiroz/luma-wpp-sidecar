@@ -1,90 +1,75 @@
-# 🚀 Luma WPP Sidecar v2 — Gestor de Grupos e Entrada de Estoque
+# 🚀 Luma WPP Sidecar v3 — Grupos, Entrada de Estoque e Fila Anti-Ban
 
 Microserviço Node.js que estende o CRM Luma (Google Apps Script). A API Oficial da Meta
-é excelente para atendimento 1‑a‑1 e cobrança, mas **não cria grupos, não adiciona
-participantes e não lê grupos**. Este serviço cobre exatamente esse buraco, usando
-[`@whiskeysockets/baileys`](https://github.com/WhiskeySockets/Baileys) numa conexão
-paralela — enquanto o número oficial continua responsável pelo atendimento e pelo dinheiro.
+é ótima para atendimento 1‑a‑1 e cobrança, mas **não cria grupos, não publica em grupos e
+não lê grupos**. Este serviço cobre exatamente esse buraco usando
+[`@whiskeysockets/baileys`](https://github.com/WhiskeySockets/Baileys) num número auxiliar —
+enquanto o **número oficial continua responsável pelo atendimento e pelo dinheiro**.
 
 > ⚠️ **Não use o seu número pessoal.** A conexão é extraoficial: a Meta pode banir o
-> número que cria grupos e dispara catálogo em volume. Use um chip dedicado
-> (eSIM pré‑pago resolve) e ative a verificação em duas etapas nele.
+> número que cria grupos e dispara ofertas em volume. Use um chip dedicado (eSIM pré‑pago
+> resolve), ative a verificação em duas etapas e mantenha a recarga em dia.
 
 ---
 
-## 🔄 O ciclo que este serviço sustenta
+## 🔄 O ciclo completo
 
 ```
-   FORNECEDOR                    ESTE SERVIÇO                  APPS SCRIPT
-┌───────────────┐            ┌──────────────────┐          ┌────────────────┐
-│ posta foto +  │  grupo de  │ escuta SÓ os     │ webhook  │ lê pelo layout │
-│ legenda com   ├───────────►│ grupos da        ├─────────►│ (ou pela IA),  │
-│ preço e qtd   │  entrada   │ allowlist e      │  POST    │ calcula preço  │
-└───────────────┘            │ baixa a imagem   │          │ e enfileira    │
-                             └──────────────────┘          └───────┬────────┘
-                                                                   │ aprovação
-                                                                   ▼
-   CLIENTE                      ESTE SERVIÇO                 ┌────────────────┐
-┌───────────────┐            ┌──────────────────┐            │ produto criado │
-│ clica no      │  grupo de  │ publica foto +   │            │ no estoque +   │
-│ link wa.me    │◄───────────┤ preço + botão    │◄───────────┤ link Mercado   │
-│ [#vd-codigo]  │  clientes  │ /enviar-grupo-   │            │ Pago           │
-└───────┬───────┘            │ midia            │            └────────────────┘
-        │                    └──────────────────┘
-        ▼
-┌────────────────────────────────────────┐
-│ NÚMERO OFICIAL (Meta Cloud API)        │
-│ IA de vendas assume → pagamento ✅     │
-└────────────────────────────────────────┘
+   FORNECEDOR                 SIDECAR (este serviço)              APPS SCRIPT
+┌──────────────┐  grupo de  ┌───────────────────────┐ webhook ┌──────────────────┐
+│ foto + preço ├───────────►│ escuta SÓ a allowlist ├────────►│ lê layout / IA,  │
+└──────────────┘  entrada   │ baixa a imagem        │  POST   │ calcula preço,   │
+                            └───────────────────────┘         │ fila de aprovação│
+                                                              └────────┬─────────┘
+                                                                       │ aprovado
+   CLIENTE NO GRUPO          FILA ANTI-BAN (envio_fila)                ▼
+┌──────────────────┐       ┌───────────────────────┐        ┌──────────────────┐
+│ vê o post com    │◄──────┤ cadência humana,      │◄───────┤ vitrine / resumo │
+│ foto + "Quero    │ grupo │ "digitando...", tetos │ /api/  │ com link por     │
+│ este" (wa.me)    │       │ e janela de horário   │ fila-  │ produto          │
+└───┬──────────┬───┘       └───────────────────────┘ envio  └──────────────────┘
+    │ toca no   │ responde "quero" citando o post
+    │ link      ▼
+    │   ┌───────────────────────────────┐
+    │   │ sidecar responde no grupo com │
+    │   │ @menção + link do oficial     │
+    │   └───────────────┬───────────────┘
+    ▼                   ▼
+┌───────────────────────────────────────────────────────────────┐
+│ NÚMERO OFICIAL (Cloud API)  "Quero: Tênis 🛒 [#vd-a1b2c3:PROD-1]" │
+│ doPost reconhece grupo + produto → fotos, variações, frete ou    │
+│ link de pagamento → IA do grupo assume → pagamento ✅            │
+└───────────────────────────────────────────────────────────────┘
 ```
+
+O número auxiliar **só fala em grupo**. Conversa privada é sempre do oficial — é isso que
+mantém o auxiliar longe do banimento. A rota de envio recusa qualquer destino que não seja
+`@g.us`.
 
 ---
 
-## 🏗️ Arquitetura
+## 🆕 O que mudou na v3
 
-### 1. Motor de mensageria (Baileys)
-
-- `syncFullHistory: false` — não baixa histórico antigo, poupando RAM.
-- **Escuta seletiva:** diferente da v1 (que não escutava nada), a v2 ouve
-  `messages.upsert`, mas descarta tudo que **não** seja de um grupo presente na
-  allowlist enviada pelo Apps Script — antes mesmo de baixar qualquer mídia.
-  Nenhuma conversa pessoal ou de atendimento é lida.
-- `printQRInTerminal: false` — o QR **nunca** vai para os logs do Render. Quem tivesse
-  acesso a um print de log pareava o próprio aparelho na sua conta.
-
-### 2. Persistência da sessão (MongoDB Atlas)
-
-Plataformas como o Render limpam o disco ao hibernar ou reiniciar, o que forçaria a
-leitura diária do QR Code. As chaves criptográficas da sessão são gravadas num
-adaptador customizado direto no MongoDB (coleção `auth_info`).
-
-> 🔑 Quem tem a `MONGO_URI` tem a sua sessão do WhatsApp. Use um usuário exclusivo,
-> senha forte, e não reaproveite essa string em nenhum outro projeto.
-
-### 3. Resiliência
-
-| Mecanismo | O que resolve |
+| Novidade | Para quê |
 | --- | --- |
-| **Reconexão em qualquer queda** | A v1 limpava a sessão no `loggedOut` e **parava** — nunca reconectava. O `/api/qr` respondia `starting` para sempre e só um restart manual resolvia. Agora reconecta nos dois casos: queda → restaura; logout → emite QR novo. |
-| **Watchdog (30s)** | Se passar 2 minutos sem conexão e sem QR, força um socket novo. Um evento perdido não deixa mais o serviço mudo. |
-| **`try/catch` na inicialização** | Se o `makeWASocket` estourar, nenhum listener existiria e o serviço morreria em silêncio. Agora reagenda em 15s. |
-| **Fila de reenvio (`entrada_fila`)** | Se o Apps Script estiver fora do ar, a mensagem do fornecedor fica no Mongo e um worker tenta de novo a cada minuto (até 5 vezes). Nenhum produto se perde. |
-| **Trava anti-duplicata** | IDs de mensagem já processados ficam em memória; o Apps Script também deduplica por `messageId`. |
+| **Fila de envio anti-ban** (`envio_fila`) | Tudo que vai para grupo entra numa fila persistente no Mongo e sai com intervalo aleatório (25–60s), "digitando..." antes, teto por hora / 24h / grupo e **janela de horário** (08:00–21:30 por padrão). Reinício do Render não perde nada; `idempotencyKey` impede post duplicado. |
+| **Resposta no grupo** | Quem responde **citando um post nosso** recebe, no próprio grupo, uma menção com o link do número oficial daquele produto. Opcional por grupo (ou também por palavras como "quero", "valor", "preço"), com anti-spam por pessoa. |
+| **LID resolvido** | Baileys v7 mostra participantes como `@lid`. Agora o telefone vem de `phoneNumber`, `participantAlt` ou do mapeamento LID→PN — menos "ocultos" na importação e remetente correto na entrada. |
+| **Conexão mais estável** | Socket antigo é fechado antes de abrir outro; backoff progressivo; espera de 60s no erro 440 (deploy com duas instâncias); `getMessage` para reenvio; cache de metadados dos grupos; desligamento gracioso no SIGTERM. |
+| **Fila de entrada que desiste** | Entrega ao Apps Script que falhou 5 vezes vira `falhou` (some em 14 dias) em vez de ficar "pendente" para sempre. Resposta HTML do Google (URL `/dev`, implantação errada) agora conta como falha. |
+| **Embedded Signup montado** | `embedded-signup.js` agora está no repositório e é montado **antes** do guard da API (o navegador do cliente chama `/api/es/finalizar` sem chave). |
+| **Teste automatizado** | `npm test` sobe o servidor com dublês do WhatsApp e do Mongo e testa fila, janela, tetos, idempotência, resposta no grupo, entrada e LID. |
 
 ---
 
 ## 🔐 Segurança
 
-Este repositório é **público**. Qualquer pessoa lê quais rotas existem e o que cada uma
-espera — e tudo bem: segurança que depende de "ninguém achar o código" não é segurança.
-A proteção real é a chave.
-
-- **`API_SECRET` é obrigatório** (mínimo 20 caracteres). Sem ele o serviço recusa 100%
-  das rotas `/api` com **503** *e não conecta no WhatsApp*. Assim nunca existe uma janela
-  em que a sessão está de pé e desprotegida — o cenário em que um estranho pediria
-  `/api/qr`, escaneasse e passasse a agir como você.
+- **`API_SECRET` é obrigatório** (mín. 20 caracteres). Sem ele todas as rotas `/api`
+  respondem **503** *e o WhatsApp não conecta* — nunca existe janela com a sessão de pé e
+  desprotegida.
 - Comparação da chave em **tempo constante** (`crypto.timingSafeEqual`).
-- Nenhum segredo no código: tudo vem de variáveis de ambiente.
+- O QR **nunca** vai para os logs do Render.
+- Rotas públicas: só `/ping`, `/conectar` e `/api/es/finalizar` (Embedded Signup).
 
 ---
 
@@ -92,50 +77,73 @@ A proteção real é a chave.
 
 | Chave | Obrigatória | Descrição |
 | --- | :---: | --- |
-| `MONGO_URI` | ✅ | Connection string do MongoDB Atlas (onde a sessão é salva). |
-| `API_SECRET` | ✅ | Mínimo 20 caracteres. **O mesmo valor** vai no Apps Script em Propriedades do Script → `SIDECAR_API_KEY`. Gere com `openssl rand -hex 32`. |
-| `PORT` | — | O Render define sozinho. |
+| `MONGO_URI` | ✅ | Connection string do MongoDB Atlas (sessão + filas). |
+| `API_SECRET` | ✅ | Mín. 20 caracteres. **O mesmo valor** vai no Apps Script em `SIDECAR_API_KEY`. |
+| `ENVIO_INTERVALO_MIN_SEG` / `ENVIO_INTERVALO_MAX_SEG` | — | Intervalo aleatório entre posts (padrão 25 / 60). |
+| `ENVIO_MAX_POR_HORA` / `ENVIO_MAX_POR_DIA` / `ENVIO_MAX_POR_GRUPO_DIA` | — | Tetos (padrão 40 / 250 / 15), em janela móvel. |
+| `ENVIO_JANELA_INICIO` / `ENVIO_JANELA_FIM` | — | Horário em que o auxiliar pode postar (padrão 08:00–21:30). |
+| `ENVIO_DIGITANDO_SEG` | — | Segundos de "digitando..." antes de cada post (padrão 3). |
+| `TZ_ENVIO` | — | Fuso da janela (padrão `America/Sao_Paulo`). |
+| `META_APP_ID`, `META_APP_SECRET`, `META_CONFIG_ID`, `APPS_SCRIPT_URL`, `APPS_SCRIPT_SECRET`, `GRAPH_VERSION` | — | Só para o Embedded Signup (`/conectar`). `APPS_SCRIPT_SECRET` vazio = usa a `API_SECRET`. |
 
-**Node 18 ou superior** (o código usa `fetch` nativo).
+Os limites da fila também são ajustados pelo painel do CRM (**Gestão de Grupos → Saída →
+🛡️ Fila de envio**). O que o painel salva fica no Mongo e vale mais que o `.env`.
+
+**Node 22** (`engines: 22.x`). O Baileys 7 é ESM e o `require()` dele precisa de Node ≥ 20.19/22.12.
 
 ---
 
 ## 📡 Endpoints
 
-Todas as rotas `/api/*` exigem o header `x-api-key: <API_SECRET>`.
+Todas as rotas `/api/*` (exceto `/api/es/finalizar`) exigem `x-api-key: <API_SECRET>`.
 
-### Público (sem autenticação)
+### Públicas
 
 | Método | Rota | Para quê |
 | --- | --- | --- |
-| `GET` | `/ping` | Monitor de uptime. O Render grátis hiberna após ~15 min sem tráfego; aponte um pinger a cada 10 min para cá e ele nunca dorme. Devolve só `{ok, conectado}`. |
+| `GET` | `/ping` | Monitor de uptime (aponte um pinger a cada 10 min — o Render grátis hiberna em ~15). |
+| `GET` | `/conectar` | Página do Embedded Signup (Coexistence). |
+| `POST` | `/api/es/finalizar` | Recebe o `code` do navegador, troca pelo token **no servidor** e avisa o Apps Script. |
 
 ### Conexão
 
 | Método | Rota | Para quê |
 | --- | --- | --- |
-| `GET` | `/api/qr` | Status (`connected` / `pending` / `starting`). Em `pending` devolve o QR em base64. Após 90s travado, informa há quanto tempo tenta e o último motivo de queda. |
-| `GET` | `/api/health` | Diagnóstico geral. |
-| `POST` | `/api/resetar-sessao` | Apaga a sessão e força QR novo. Use quando travar em "iniciando". |
+| `GET` | `/api/qr` | `connected` / `pending` (com QR base64) / `starting` (com diagnóstico). |
+| `GET` | `/api/health` | Diagnóstico geral + resumo da fila de envio. |
+| `POST` | `/api/resetar-sessao` | Apaga a sessão e força QR novo. |
 
 ### Grupos
 
 | Método | Rota | Payload / Query |
 | --- | --- | --- |
-| `GET` | `/api/listar-grupos` | `?busca=` (mín. 3 letras, máx. 20 resultados) |
-| `GET` | `/api/grupo-participantes` | `?groupId=` — devolve números e quantos estão ocultos por LID |
+| `GET` | `/api/listar-grupos` | `?busca=` (mín. 3 letras, máx. 20 resultados, cache de 60s) |
+| `GET` | `/api/grupo-participantes` | `?groupId=` — números (LID resolvido) e quantos seguem ocultos |
+| `GET` | `/api/grupo-convite` | `?groupId=` — link `chat.whatsapp.com` (o auxiliar precisa ser admin) |
 | `POST` | `/api/adicionar-grupo` | `{ nomeGrupo, clientesPhones: [] }` |
-| `POST` | `/api/adicionar-membros-grupo` | `{ groupId, clientesPhones: [] }` |
-| `POST` | `/api/enviar-grupo` | `{ groupId, message }` |
-| `POST` | `/api/enviar-grupo-midia` | `{ groupId, imagemBase64, mimeType, caption }` |
+| `POST` | `/api/adicionar-membros-grupo` | `{ groupId, clientesPhones: [] }` → inclui `bloqueadosPorPrivacidade` |
 
-### Entrada de fornecedores
+### Fila de envio (anti-ban)
+
+| Método | Rota | Payload / Query |
+| --- | --- | --- |
+| `POST` | `/api/fila-envio` | `{ origem, itens: [{ groupId, tipo: 'texto'\|'imagem', texto, imagemBase64?, imagemUrl?, mimeType?, ref?, linkResposta?, prioridade?, ignorarJanela?, idempotencyKey?, agendarPara? }] }` — até 50 itens; responde na hora com o resumo da fila. |
+| `GET` | `/api/fila-envio` | `?status=&groupId=&limite=` — últimos itens + resumo + config. |
+| `POST` | `/api/fila-envio/cancelar` | `{ ids? \| groupId? \| origem? \| todos: true }` — cancela pendentes. |
+| `GET` / `POST` | `/api/config-envio` | Lê / salva intervalos, tetos, janela e `pausado`. |
+| `POST` | `/api/enviar-grupo` | *(compatibilidade)* `{ groupId, message }` — passa pela fila e espera até ~40s. |
+| `POST` | `/api/enviar-grupo-midia` | *(compatibilidade)* `{ groupId, imagemBase64\|imagemUrl, mimeType, caption }` |
+
+`linkResposta` é o link do número oficial daquele post: é ele que o sidecar usa quando
+alguém responde citando o post no grupo.
+
+### Escuta (entrada de fornecedores + resposta em grupos de clientes)
 
 | Método | Rota | Para quê |
 | --- | --- | --- |
-| `POST` | `/api/config-entrada` | `{ webhookUrl, secret, grupos: [{groupId, nome}] }` — define **o que escutar** e **para onde mandar**. Sem isto o serviço fica mudo. |
-| `GET` | `/api/config-entrada` | Quantos grupos está escutando e quantos itens estão presos na fila. |
-| `POST` | `/api/reprocessar-fila` | Força o reenvio do que estiver pendente. |
+| `POST` | `/api/config-entrada` | `{ webhookUrl, secret, grupos: [{groupId, nome}], gruposResposta: [{groupId, nome, modo, link}] }` — recusa URL `/dev`. |
+| `GET` | `/api/config-entrada` | Quantos grupos escuta, pendentes e desistências da fila de entrada. |
+| `POST` | `/api/reprocessar-fila` | Reenvia o que estiver preso (inclusive os que tinham desistido). |
 
 **Payload entregue ao Apps Script** quando um fornecedor posta:
 
@@ -157,14 +165,21 @@ Todas as rotas `/api/*` exigem o header `x-api-key: <API_SECRET>`.
 
 ## 🚀 Deploy no Render
 
-1. `Build Command`: `npm install`
-2. `Start Command`: `npm start`
-3. Em **Environment**, defina `MONGO_URI` e `API_SECRET`.
-4. Deploy. Confira `https://SEU-APP.onrender.com/ping` — deve responder `{"ok":true}`.
+1. `Build Command`: `npm install` · `Start Command`: `npm start`
+2. **Environment**: `MONGO_URI` e `API_SECRET` (e, se quiser, os `ENVIO_*`).
+3. Deploy. Confira `https://SEU-APP.onrender.com/ping` → `{"ok":true}`.
+4. No Apps Script: publique o `Grupos.gs` e uma **nova versão** do Web App; defina
+   `WEBAPP_URL` (a URL `/exec`) nas Propriedades do Script.
 5. No painel do CRM: **Gestão de Grupos → Entrada → 🔄 Sincronizar escuta**.
 
-> Se os logs mostrarem `❌ BLOQUEADO`, o `API_SECRET` está ausente ou tem menos de
-> 20 caracteres. O WhatsApp não conecta de propósito nessa situação.
+## 🧪 Teste local
+
+```bash
+npm install
+npm test
+```
+
+Não precisa de WhatsApp nem de MongoDB: o teste troca os dois por dublês em memória.
 
 ---
 
@@ -172,12 +187,14 @@ Todas as rotas `/api/*` exigem o header `x-api-key: <API_SECRET>`.
 
 | Sintoma | Causa provável |
 | --- | --- |
-| `/api/qr` preso em `starting` para sempre | Versão antiga do `server.js` (bug do `loggedOut`). Atualize e reinicie. |
 | Rotas respondendo **503** | `API_SECRET` ausente ou com menos de 20 caracteres. |
 | Rotas respondendo **401** | `API_SECRET` (Render) ≠ `SIDECAR_API_KEY` (Apps Script). |
-| "Escutando 0 grupos" | Faltou clicar em **Sincronizar escuta** no painel. |
-| Fornecedor postou e nada chegou | Grupo pausado, ou fora da allowlist, ou o layout exige foto e a mensagem veio sem. |
-| Itens acumulados em `entrada_fila` | Web App do Apps Script fora do ar. O worker reenvia sozinho. |
+| Posts "na fila" mas nada sai | Veja o painel 🛡️: fora da janela, fila pausada, teto atingido ou aparelho desconectado. |
+| Post saiu só com texto | A imagem não pôde ser baixada (arquivo do Drive não público e sem base64). |
+| Erro `Grupo inacessível` | O número auxiliar saiu ou foi removido do grupo. |
+| Quedas 440 em sequência | Duas instâncias com a mesma sessão (deploy sobreposto ou outro serviço usando o mesmo Mongo). |
+| Fornecedor postou e nada chegou | Grupo pausado, fora da allowlist, URL `/dev` no Apps Script, ou layout exige foto e veio sem. |
+| Itens em `entrada_fila` | Web App fora do ar. O worker reenvia sozinho a cada minuto (até 5 vezes). |
 | Serviço demora 30–60s a cada acesso | Hibernação do Render. Configure o pinger em `/ping`. |
 
 ---
