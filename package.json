@@ -10,7 +10,7 @@
   "scripts": {
     "start": "node server.js",
     "dev": "node --watch server.js",
-    "test": "node test/sidecar.test.js"
+    "test": "node test/sidecar.test.js && node test/embedded-signup.test.js"
   },
   "keywords": [
     "whatsapp",

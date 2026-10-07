@@ -198,6 +198,9 @@ app.get('/ping', (req, res) => {
 // /conectar é a página que o cliente abre; /api/es/finalizar é chamado
 // pelo navegador dele (que não tem, nem pode ter, a API_SECRET).
 // =====================================================================
+// O módulo usa a URL do Apps Script que o próprio CRM sincronizou (se APPS_SCRIPT_URL
+// não estiver definida) e o Mongo para não perder um onboarding se o GAS estiver fora.
+app.locals.gasUrl = () => entradaCfg.webhookUrl;
 try {
     const embeddedSignup = require('./embedded-signup');
     app.use(embeddedSignup);
@@ -1069,8 +1072,9 @@ app.get('/api/qr', (req, res) => {
 });
 
 app.get('/api/health', async (req, res) => {
-    let fila = null;
+    let fila = null, onboardingsPendentes = 0;
     try { fila = await resumoFilaEnvio(); } catch (e) { /* mongo indisponível */ }
+    try { onboardingsPendentes = await app.locals.db.collection('onboarding_pendente').countDocuments({}); } catch (e) { /* idem */ }
     res.json({
         status: 'ok',
         versao: 3,
@@ -1078,6 +1082,11 @@ app.get('/api/health', async (req, res) => {
         gruposEscutando: entradaGruposSet.size,
         gruposComResposta: respostaGruposMap.size,
         webhookConfigurado: !!entradaCfg.webhookUrl,
+        embeddedSignup: {
+            configurado: !!(process.env.META_APP_ID && process.env.META_APP_SECRET && process.env.META_CONFIG_ID),
+            graphVersion: process.env.GRAPH_VERSION || 'v25.0',
+            onboardingsPendentes
+        },
         filaEnvio: fila
     });
 });
@@ -1454,6 +1463,7 @@ async function startServer() {
         return;
     }
     const db = mongoClient.db(DBNAME);
+    app.locals.db = db;
     await prepararColecoes(db);
     console.log('📦 Conectado ao MongoDB com sucesso!');
 

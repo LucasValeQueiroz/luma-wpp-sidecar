@@ -58,7 +58,8 @@ mantém o auxiliar longe do banimento. A rota de envio recusa qualquer destino q
 | **Conexão mais estável** | Socket antigo é fechado antes de abrir outro; backoff progressivo; espera de 60s no erro 440 (deploy com duas instâncias); `getMessage` para reenvio; cache de metadados dos grupos; desligamento gracioso no SIGTERM. |
 | **Fila de entrada que desiste** | Entrega ao Apps Script que falhou 5 vezes vira `falhou` (some em 14 dias) em vez de ficar "pendente" para sempre. Resposta HTML do Google (URL `/dev`, implantação errada) agora conta como falha. |
 | **Embedded Signup montado** | `embedded-signup.js` agora está no repositório e é montado **antes** do guard da API (o navegador do cliente chama `/api/es/finalizar` sem chave). |
-| **Teste automatizado** | `npm test` sobe o servidor com dublês do WhatsApp e do Mongo e testa fila, janela, tetos, idempotência, resposta no grupo, entrada e LID. |
+| **Embedded Signup v4** | Sem `sessionInfoVersion`, Coexistence por `featureType`, opção "número novo", `subscribed_apps` + sincronização de contatos/histórico automáticos, Graph v25 e reenvio se o Apps Script estiver fora. |
+| **Teste automatizado** | `npm test` sobe o servidor com dublês do WhatsApp, do Mongo e da Graph API e testa fila, janela, tetos, idempotência, resposta no grupo, entrada, LID e o onboarding v4. |
 
 ---
 
@@ -84,7 +85,13 @@ mantém o auxiliar longe do banimento. A rota de envio recusa qualquer destino q
 | `ENVIO_JANELA_INICIO` / `ENVIO_JANELA_FIM` | — | Horário em que o auxiliar pode postar (padrão 08:00–21:30). |
 | `ENVIO_DIGITANDO_SEG` | — | Segundos de "digitando..." antes de cada post (padrão 3). |
 | `TZ_ENVIO` | — | Fuso da janela (padrão `America/Sao_Paulo`). |
-| `META_APP_ID`, `META_APP_SECRET`, `META_CONFIG_ID`, `APPS_SCRIPT_URL`, `APPS_SCRIPT_SECRET`, `GRAPH_VERSION` | — | Só para o Embedded Signup (`/conectar`). `APPS_SCRIPT_SECRET` vazio = usa a `API_SECRET`. |
+| `META_APP_ID`, `META_APP_SECRET` | — | Só para o Embedded Signup (`/conectar`). |
+| `META_CONFIG_ID` | — | ID da configuração **v4** de *Login do Facebook para Empresas* (variação WhatsApp Embedded Signup). |
+| `META_CONFIG_ID_COEX` | — | Opcional: config separada só para Coexistence. |
+| `META_ES_EXTRAS_COEX` / `META_ES_EXTRAS` | — | Opcional: o `extras` exato gerado pelo Embedded Signup Builder (JSON). Padrão Coexistence: `{"setup":{},"featureType":"whatsapp_business_app_onboarding"}`; número novo: `{}`. |
+| `META_REGISTER_PIN` | — | Opcional: PIN de 6 dígitos para registrar números novos automaticamente. |
+| `APPS_SCRIPT_URL` / `APPS_SCRIPT_SECRET` | — | Opcionais: vazio = a URL `/exec` sincronizada pelo CRM e a própria `API_SECRET`. |
+| `GRAPH_VERSION` | — | Padrão `v25.0`. |
 
 Os limites da fila também são ajustados pelo painel do CRM (**Gestão de Grupos → Saída →
 🛡️ Fila de envio**). O que o painel salva fica no Mongo e vale mais que o `.env`.
@@ -103,7 +110,8 @@ Todas as rotas `/api/*` (exceto `/api/es/finalizar`) exigem `x-api-key: <API_SEC
 | --- | --- | --- |
 | `GET` | `/ping` | Monitor de uptime (aponte um pinger a cada 10 min — o Render grátis hiberna em ~15). |
 | `GET` | `/conectar` | Página do Embedded Signup (Coexistence). |
-| `POST` | `/api/es/finalizar` | Recebe o `code` do navegador, troca pelo token **no servidor** e avisa o Apps Script. |
+| `POST` | `/api/es/finalizar` | Embedded Signup v4: troca o `code` pelo token **no servidor**, descobre WABA/número, assina o app na WABA (`subscribed_apps`), pede a sincronização de contatos e histórico (Coexistence) e avisa o Apps Script. |
+| `POST` | `/api/es/reenviar-pendentes` | *(com `x-api-key`)* Reenvia ao Apps Script os onboardings guardados enquanto ele estava fora. |
 
 ### Conexão
 
