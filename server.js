@@ -60,7 +60,8 @@ const {
     initAuthCreds,
     BufferJSON,
     downloadMediaMessage,
-    fetchLatestWaWebVersion
+    fetchLatestWaWebVersion,
+    jidNormalizedUser
 } = require('@whiskeysockets/baileys');
 const { MongoClient, ObjectId } = require('mongodb');
 const qrcode = require('qrcode');
@@ -1418,7 +1419,25 @@ const criacoesRecentes = new Map();      // chave -> { assinatura, ts, promessa 
 const JANELA_CHAVE_MS = 15 * 60 * 1000;
 const JANELA_REPETICAO_MS = 3 * 60 * 1000;
 
-async function criarGrupoCompleto({ nome, descricao, numeros, somenteAdminsEnviam, somenteAdminsEditam }) {
+// Foto de grupo: o painel já manda 640x640 em JPEG; o Baileys (com sharp) só ajusta.
+const MAX_FOTO_BYTES = 5 * 1024 * 1024;
+function bufferDaImagem(base64) {
+    const limpo = String(base64 || '').replace(/^data:[^;]+;base64,/, '');
+    const buf = Buffer.from(limpo, 'base64');
+    if (!buf.length) throw new Error('Imagem vazia ou inválida.');
+    if (buf.length > MAX_FOTO_BYTES) throw new Error('A foto passa de 5 MB.');
+    return buf;
+}
+
+// Erros do WhatsApp em português que dá para agir em cima.
+function mensagemErroGrupo(e) {
+    const m = String((e && e.message) || e);
+    if (/not-authorized|forbidden|\b40[13]\b/i.test(m)) return 'O número auxiliar precisa ser ADMIN do grupo para fazer isso.';
+    if (/item-not-found|\b404\b/i.test(m)) return 'Grupo não encontrado (o número auxiliar ainda participa dele?).';
+    return m;
+}
+
+async function criarGrupoCompleto({ nome, descricao, numeros, somenteAdminsEnviam, somenteAdminsEditam, foto }) {
     let grupo;
     try {
         grupo = await sock.groupCreate(nome, numeros.map(n => `${n}@s.whatsapp.net`));
@@ -1433,6 +1452,7 @@ async function criarGrupoCompleto({ nome, descricao, numeros, somenteAdminsEnvia
     // Ajustes opcionais: se um falhar o grupo já existe, então só avisa.
     const avisos = [];
     const tentar = async (rotulo, fn) => { try { await fn(); } catch (e) { avisos.push(`${rotulo}: ${e.message}`); } };
+    if (foto) await tentar('Foto do grupo', () => sock.updateProfilePicture(groupId, foto));
     if (descricao) await tentar('Descrição', () => sock.groupUpdateDescription(groupId, descricao));
     if (somenteAdminsEnviam) await tentar('Só admins enviam', () => sock.groupSettingUpdate(groupId, 'announcement'));
     if (somenteAdminsEditam) await tentar('Só admins editam', () => sock.groupSettingUpdate(groupId, 'locked'));
@@ -1482,6 +1502,7 @@ app.post('/api/criar-grupo', async (req, res) => {
         if (numeros.length > MAX_PARTICIPANTES_CRIACAO) {
             throw new Error(`No máximo ${MAX_PARTICIPANTES_CRIACAO} participantes por vez. Convide o resto pelo link do grupo.`);
         }
+        const foto = b.fotoBase64 ? bufferDaImagem(b.fotoBase64) : null;   // inválida: avisa antes de criar
 
         const agora = Date.now();
         for (const [k, v] of criacoesRecentes) if (agora - v.ts > JANELA_CHAVE_MS) criacoesRecentes.delete(k);
@@ -1499,7 +1520,7 @@ app.post('/api/criar-grupo', async (req, res) => {
         const registro = {
             assinatura,
             ts: agora,
-            promessa: criarGrupoCompleto({ nome, descricao, numeros, somenteAdminsEnviam: !!b.somenteAdminsEnviam, somenteAdminsEditam: !!b.somenteAdminsEditam })
+            promessa: criarGrupoCompleto({ nome, descricao, numeros, foto, somenteAdminsEnviam: !!b.somenteAdminsEnviam, somenteAdminsEditam: !!b.somenteAdminsEditam })
         };
         criacoesRecentes.set(chave, registro);
         // Falhou: libera a chave para uma nova tentativa de verdade.
@@ -1508,6 +1529,191 @@ app.post('/api/criar-grupo', async (req, res) => {
         res.json(await registro.promessa);
     } catch (error) {
         res.status(500).json({ status: 'error', message: error.message || String(error) });
+    }
+});
+
+// ---------- GERENCIAR GRUPO (foto, dados, participantes) ----------
+
+function ehMeuJid(jid) {
+    const me = sock && sock.user;
+    if (!me || !jid) return false;
+    const alvo = jidNormalizedUser(jid);
+    return alvo === jidNormalizedUser(me.id) || (!!me.lid && alvo === jidNormalizedUser(me.lid));
+}
+
+function groupIdValido(v) {
+    const id = String(v || '');
+    if (!id.endsWith('@g.us')) throw new Error('groupId inválido.');
+    return id;
+}
+
+// Tudo o que a tela "Gerenciar grupo" mostra, numa chamada só.
+app.get('/api/grupo-detalhes', async (req, res) => {
+    try {
+        if (!isConnected) throw new Error('WhatsApp deslogado.');
+        const groupId = groupIdValido(req.query.groupId);
+        const meta = await metadadosGrupo(groupId, true);
+        const meuNumero = numeroDoJid(sock.user && sock.user.id);
+
+        const participantes = [];
+        for (const p of (meta.participants || [])) {
+            const numero = await resolverTelefone(p.phoneNumber || p.id, p.id);
+            const contato = numero ? contatosWa.get(numero) : null;
+            participantes.push({
+                id: p.id,                                  // é este id que remove/promove
+                numero,                                    // '' = oculto pela privacidade (LID)
+                nome: contato ? (contato.nome || contato.notify) : '',
+                admin: p.admin || null,                    // 'superadmin' | 'admin' | null
+                eu: ehMeuJid(p.id) || (!!numero && numero === meuNumero)
+            });
+        }
+        // Eu, donos, admins; depois por nome — sem nome e ocultos (LID) no fim.
+        const peso = p => (p.eu ? 0 : p.admin === 'superadmin' ? 1 : p.admin ? 2 : 3);
+        const ordem = new Intl.Collator('pt-BR', { numeric: true, sensitivity: 'base' });
+        participantes.sort((a, b) => peso(a) - peso(b) || (!a.nome) - (!b.nome) || (!a.numero) - (!b.numero) ||
+            ordem.compare(a.nome || a.numero, b.nome || b.numero));
+
+        // Grupo sem foto: o WhatsApp responde 404. Não é erro, só fica sem.
+        let foto = '';
+        try { foto = (await sock.profilePictureUrl(groupId, 'image', 8000)) || ''; } catch (e) { /* sem foto */ }
+
+        const eu = participantes.find(p => p.eu);
+        res.json({
+            status: 'success',
+            groupId,
+            nome: meta.subject || '',
+            descricao: meta.desc || '',
+            tamanho: meta.size || participantes.length,
+            criadoEm: meta.creation ? meta.creation * 1000 : null,
+            somenteAdminsEnviam: !!meta.announce,
+            somenteAdminsEditam: !!meta.restrict,
+            souAdmin: !!(eu && eu.admin),
+            foto,
+            participantes
+        });
+    } catch (error) {
+        res.status(500).json({ status: 'error', message: mensagemErroGrupo(error) });
+    }
+});
+
+// Troca (imagemBase64) ou tira (remover: true) a foto do grupo.
+app.post('/api/grupo-foto', async (req, res) => {
+    try {
+        if (!isConnected) throw new Error('WhatsApp deslogado.');
+        const b = req.body || {};
+        const groupId = groupIdValido(b.groupId);
+        if (b.remover) await sock.removeProfilePicture(groupId);
+        else await sock.updateProfilePicture(groupId, bufferDaImagem(b.imagemBase64));
+        let foto = '';
+        if (!b.remover) {
+            try { foto = (await sock.profilePictureUrl(groupId, 'image', 8000)) || ''; } catch (e) { /* ainda processando */ }
+        }
+        res.json({ status: 'success', foto });
+    } catch (error) {
+        res.status(500).json({ status: 'error', message: mensagemErroGrupo(error) });
+    }
+});
+
+// Nome, descrição e permissões. Só mexe no que vier no pedido.
+app.post('/api/grupo-editar', async (req, res) => {
+    try {
+        if (!isConnected) throw new Error('WhatsApp deslogado.');
+        const b = req.body || {};
+        const groupId = groupIdValido(b.groupId);
+        const passos = [];
+        if (b.nome !== undefined) {
+            const nome = String(b.nome).trim();
+            if (!nome || nome.length > 100) throw new Error('O nome do grupo precisa ter de 1 a 100 caracteres.');
+            passos.push(['Nome', () => sock.groupUpdateSubject(groupId, nome)]);
+        }
+        if (b.descricao !== undefined) {
+            const descricao = String(b.descricao).trim();
+            if (descricao.length > 2048) throw new Error('A descrição pode ter no máximo 2048 caracteres.');
+            passos.push(['Descrição', () => sock.groupUpdateDescription(groupId, descricao || undefined)]);
+        }
+        if (b.somenteAdminsEnviam !== undefined) {
+            passos.push(['Quem envia mensagens', () => sock.groupSettingUpdate(groupId, b.somenteAdminsEnviam ? 'announcement' : 'not_announcement')]);
+        }
+        if (b.somenteAdminsEditam !== undefined) {
+            passos.push(['Quem edita os dados', () => sock.groupSettingUpdate(groupId, b.somenteAdminsEditam ? 'locked' : 'unlocked')]);
+        }
+        if (!passos.length) throw new Error('Nada para alterar.');
+
+        const feitos = [], erros = [];
+        for (const [rotulo, fn] of passos) {
+            try { await fn(); feitos.push(rotulo); } catch (e) { erros.push(`${rotulo}: ${mensagemErroGrupo(e)}`); }
+        }
+        cacheGrupos.delete(groupId);
+        cacheListaGrupos.ts = 0;   // nome novo aparece na busca
+        if (!feitos.length) throw new Error(erros.join(' · '));
+        res.json({ status: 'success', feitos, erros });
+    } catch (error) {
+        res.status(500).json({ status: 'error', message: mensagemErroGrupo(error) });
+    }
+});
+
+// Adicionar, remover, tornar admin ou tirar admin. "participantes" aceita números
+// (para adicionar) ou os ids devolvidos por /api/grupo-detalhes (para os demais).
+const ACOES_PARTICIPANTES = { add: 'adicionar', remove: 'remover', promote: 'tornar admin', demote: 'tirar admin' };
+const MOTIVO_STATUS_PARTICIPANTE = {
+    '401': 'o número auxiliar não é admin do grupo',
+    '403': 'sem permissão (o número auxiliar é admin do grupo?)',
+    '403-add': 'a privacidade da pessoa só permite entrar por convite',
+    '404': 'não está no grupo',
+    '406': 'número inválido ou sem WhatsApp',
+    '408': 'saiu do grupo há pouco e ainda não pode voltar',
+    '409': 'já está no grupo'
+};
+app.post('/api/grupo-participantes/alterar', async (req, res) => {
+    try {
+        if (!isConnected) throw new Error('WhatsApp deslogado.');
+        const b = req.body || {};
+        const groupId = groupIdValido(b.groupId);
+        const acao = String(b.acao || '');
+        if (!ACOES_PARTICIPANTES[acao]) throw new Error('Ação inválida.');
+
+        const jids = [...new Set((Array.isArray(b.participantes) ? b.participantes : []).map(p => {
+            const s = String(p || '').trim();
+            if (s.includes('@')) return s;
+            const n = soDigitos(s);
+            return n.length >= 10 && n.length <= 15 ? `${n}@s.whatsapp.net` : '';
+        }).filter(Boolean))];
+        if (!jids.length) throw new Error('Nenhum participante válido.');
+        if (jids.length > MAX_PARTICIPANTES_CRIACAO) throw new Error(`No máximo ${MAX_PARTICIPANTES_CRIACAO} por vez.`);
+        if (acao !== 'add' && jids.some(ehMeuJid)) throw new Error('O número auxiliar não pode remover nem rebaixar a si mesmo por aqui.');
+
+        const resultado = await sock.groupParticipantsUpdate(groupId, jids, acao);
+        cacheGrupos.delete(groupId);
+        const itens = [];
+        for (const r of (resultado || [])) {
+            const status = String(r.status || '200');
+            itens.push({
+                jid: r.jid,
+                numero: await resolverTelefone(r.jid),
+                ok: status === '200',
+                status,
+                motivo: status === '200' ? '' :
+                    (MOTIVO_STATUS_PARTICIPANTE[status + '-' + acao] || MOTIVO_STATUS_PARTICIPANTE[status] || 'erro ' + status)
+            });
+        }
+        const ok = itens.filter(i => i.ok).length;
+        console.log(`👥 ${ACOES_PARTICIPANTES[acao]}: ${ok}/${itens.length} em ${groupId}`);
+        res.json({ status: 'success', acao, ok, falhas: itens.length - ok, itens });
+    } catch (error) {
+        res.status(500).json({ status: 'error', message: mensagemErroGrupo(error) });
+    }
+});
+
+// Link novo: o antigo para de funcionar (útil se o link vazou para quem não devia).
+app.post('/api/grupo-convite/revogar', async (req, res) => {
+    try {
+        if (!isConnected) throw new Error('WhatsApp deslogado.');
+        const groupId = groupIdValido((req.body || {}).groupId);
+        const code = await sock.groupRevokeInvite(groupId);
+        if (!code) throw new Error('O WhatsApp não devolveu o código novo.');
+        res.json({ status: 'success', link: 'https://chat.whatsapp.com/' + code });
+    } catch (error) {
+        res.status(500).json({ status: 'error', message: mensagemErroGrupo(error) });
     }
 });
 

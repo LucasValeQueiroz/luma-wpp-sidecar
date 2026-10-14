@@ -128,7 +128,12 @@ Todas as rotas `/api/*` (exceto `/api/es/finalizar`) exigem `x-api-key: <API_SEC
 | `GET` | `/api/listar-grupos` | `?busca=` (mín. 3 letras, máx. 20 resultados, cache de 60s) |
 | `GET` | `/api/grupo-participantes` | `?groupId=` — números (LID resolvido) e quantos seguem ocultos |
 | `GET` | `/api/grupo-convite` | `?groupId=` — link `chat.whatsapp.com` (o auxiliar precisa ser admin) |
-| `POST` | `/api/criar-grupo` | `{ nome, descricao?, somenteAdminsEnviam?, somenteAdminsEditam?, participantes: [] }` (máx. 50) → `groupId`, `link` de convite, `adicionados`, `naoAdicionados` (privacidade) e `avisos` |
+| `POST` | `/api/criar-grupo` | `{ nome, descricao?, somenteAdminsEnviam?, somenteAdminsEditam?, fotoBase64?, participantes: [], chave? }` (máx. 50) → `groupId`, `link` de convite, `adicionados`, `naoAdicionados` (privacidade) e `avisos`. A mesma `chave` (ou nome + participantes iguais em 3 min) nunca cria dois grupos: o repetido volta com `repetido: true`. |
+| `GET` | `/api/grupo-detalhes` | `?groupId=` — nome, descrição, permissões, URL da foto, `souAdmin` e participantes (`id`, `numero`, `nome` da agenda, `admin`, `eu`) |
+| `POST` | `/api/grupo-foto` | `{ groupId, imagemBase64 }` troca a foto · `{ groupId, remover: true }` tira |
+| `POST` | `/api/grupo-editar` | `{ groupId, nome?, descricao?, somenteAdminsEnviam?, somenteAdminsEditam? }` — só altera o que vier; devolve `feitos` e `erros` |
+| `POST` | `/api/grupo-participantes/alterar` | `{ groupId, acao: 'add'\|'remove'\|'promote'\|'demote', participantes: [] }` (números ou ids de `/api/grupo-detalhes`, máx. 50) → resultado por pessoa com o motivo das falhas |
+| `POST` | `/api/grupo-convite/revogar` | `{ groupId }` — gera link novo; o antigo para de funcionar |
 | `POST` | `/api/adicionar-grupo` | *(compatibilidade)* `{ nomeGrupo, clientesPhones: [] }` |
 | `POST` | `/api/adicionar-membros-grupo` | `{ groupId, clientesPhones: [] }` → inclui `bloqueadosPorPrivacidade` |
 

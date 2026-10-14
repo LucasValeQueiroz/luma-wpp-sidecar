@@ -33,6 +33,12 @@ function makeWASocket(opts) {
     sendMessage: async (jid, content) => { const id = 'MSG' + (enviados.length + 1); enviados.push({ jid, content, t: Date.now(), id }); return { key: { id, remoteJid: jid, fromMe: true }, message: { conversation: content.text || content.caption || '' } }; },
     user: { id: '5537900000000:7@s.whatsapp.net' },
     groupUpdateDescription: async () => {},
+    fotos: {},
+    updateProfilePicture: async (jid, buf) => { if (!Buffer.isBuffer(buf) || !buf.length) throw new Error('imagem'); s.fotos[jid] = buf.length; },
+    removeProfilePicture: async (jid) => { delete s.fotos[jid]; },
+    profilePictureUrl: async (jid) => { if (!s.fotos[jid]) throw new Error('item-not-found'); return 'https://pps.whatsapp.net/' + jid + '.jpg'; },
+    groupUpdateSubject: async (jid, nome) => { if (jid === 'semadmin@g.us') throw new Error('not-authorized'); },
+    groupRevokeInvite: async () => 'NOVO456',
     groupSettingUpdate: async (g, setting) => { if (setting === 'locked') throw new Error('not-authorized'); },
     authState: { keys: { set: async (d) => { s.chavesZeradas = d; } } },
     resyncAppState: async () => { ev.emit('contacts.upsert', [{ id: '5531977778888@s.whatsapp.net', name: 'Maria Agenda' }, { id: '5531900000001@s.whatsapp.net' }]); },
@@ -264,6 +270,59 @@ async function esperar(cond, ms = 8000) { const t = Date.now(); while (Date.now(
   r = await post('/api/criar-grupo', { nome: 'Falha Uma Vez', chave: 'k-falha' }); assert.equal(r.j.status, 'success');
   console.log('anti-duplicação ok — grupos criados neste trecho:', sockAtual.criados - criadosAntes, '(esperado 5)');
   assert.equal(sockAtual.criados - criadosAntes, 5);
+
+  // 19) foto na criação (e foto inválida não cria nada)
+  const fotoB64 = Buffer.from('jpeg-de-mentira').toString('base64');
+  r = await post('/api/criar-grupo', { nome: 'Com Foto', fotoBase64: 'data:image/jpeg;base64,' + fotoB64, chave: 'k-foto' });
+  assert.equal(r.j.status, 'success'); assert.ok(sockAtual.fotos[r.j.groupId], 'foto aplicada no grupo novo');
+  const criadosAntesFoto = sockAtual.criados;
+  r = await post('/api/criar-grupo', { nome: 'Foto Ruim', fotoBase64: '!!!', chave: 'k-foto-ruim' });
+  assert.equal(r.code, 500); assert.equal(sockAtual.criados, criadosAntesFoto);
+  console.log('foto inválida:', r.j.message);
+
+  // 20) gerenciar: detalhes (o auxiliar como superadmin aparece primeiro, nome vem da agenda)
+  const metaOriginal = sockAtual.groupMetadata;
+  sockAtual.groupMetadata = async (jid) => ({ id: jid, subject: 'Clientes VIP', desc: 'Ofertas', announce: true, restrict: false, creation: 1700000000, size: 4,
+    participants: [{ id: '5511911112222@s.whatsapp.net' }, { id: '777@lid' }, { id: '5537900000000@s.whatsapp.net', admin: 'superadmin' }, { id: '5521977776666@s.whatsapp.net', admin: 'admin' }] });
+  r = await get('/api/grupo-detalhes?groupId=a@g.us');
+  console.log('detalhes:', r.j.participantes.map(p => `${p.nome || p.numero || 'oculto'}${p.eu ? '(eu)' : ''}${p.admin ? '[' + p.admin + ']' : ''}`).join(', '));
+  assert.equal(r.j.souAdmin, true); assert.equal(r.j.somenteAdminsEnviam, true); assert.equal(r.j.foto, '');
+  assert.ok(r.j.participantes[0].eu); assert.equal(r.j.participantes[1].admin, 'admin');
+  assert.equal(r.j.participantes.find(p => p.numero === '5511911112222').nome, 'Ana Cliente');
+  assert.ok(r.j.participantes.some(p => p.id === '777@lid' && !p.numero));
+  assert.equal(r.j.participantes[r.j.participantes.length - 1].id, '777@lid');   // oculto vai para o fim
+  sockAtual.groupMetadata = metaOriginal;
+
+  // 21) foto: trocar e tirar
+  r = await post('/api/grupo-foto', { groupId: 'a@g.us', imagemBase64: fotoB64 });
+  assert.equal(r.j.foto, 'https://pps.whatsapp.net/a@g.us.jpg');
+  r = await post('/api/grupo-foto', { groupId: 'a@g.us', remover: true }); assert.equal(r.j.status, 'success');
+  assert.ok(!sockAtual.fotos['a@g.us']);
+  r = await post('/api/grupo-foto', { groupId: 'a@g.us' }); assert.equal(r.code, 500);
+
+  // 22) editar: o que falha vira aviso, o resto é aplicado; sem admin a mensagem é clara
+  r = await post('/api/grupo-editar', { groupId: 'a@g.us', nome: 'Clientes VIP 2', descricao: '', somenteAdminsEnviam: false, somenteAdminsEditam: true });
+  console.log('editar:', JSON.stringify(r.j));
+  assert.deepEqual(r.j.feitos, ['Nome', 'Descrição', 'Quem envia mensagens']); assert.equal(r.j.erros.length, 1);
+  r = await post('/api/grupo-editar', { groupId: 'semadmin@g.us', nome: 'X' });
+  assert.equal(r.code, 500); assert.ok(/ADMIN/.test(r.j.message)); console.log('sem admin:', r.j.message);
+  r = await post('/api/grupo-editar', { groupId: 'a@g.us' }); assert.equal(r.code, 500);
+
+  // 23) participantes: remover / promover; nunca o próprio auxiliar
+  r = await post('/api/grupo-participantes/alterar', { groupId: 'a@g.us', acao: 'remove', participantes: ['5511911112222@s.whatsapp.net', '777@lid'] });
+  console.log('remover:', JSON.stringify(r.j.itens));
+  assert.equal(r.j.ok, 1); assert.equal(r.j.falhas, 1); assert.ok(/admin/.test(r.j.itens[1].motivo));
+  r = await post('/api/grupo-participantes/alterar', { groupId: 'a@g.us', acao: 'add', participantes: ['5511911112222', '5511888880000'] });
+  assert.ok(/privacidade/.test(r.j.itens[1].motivo));
+  r = await post('/api/grupo-participantes/alterar', { groupId: 'a@g.us', acao: 'promote', participantes: ['5521977776666'] });
+  assert.equal(r.j.ok, 1);
+  r = await post('/api/grupo-participantes/alterar', { groupId: 'a@g.us', acao: 'remove', participantes: ['5537900000000@s.whatsapp.net'] });
+  assert.equal(r.code, 500); console.log('remover a si mesmo:', r.j.message);
+  r = await post('/api/grupo-participantes/alterar', { groupId: 'a@g.us', acao: 'apagar', participantes: ['5521977776666'] });
+  assert.equal(r.code, 500);
+
+  // 24) novo link de convite
+  r = await post('/api/grupo-convite/revogar', { groupId: 'a@g.us' }); assert.equal(r.j.link, 'https://chat.whatsapp.com/NOVO456');
 
   console.log('\n✅ TODOS OS TESTES DO SIDECAR PASSARAM');
   gasSrv.close(); process.exit(0);
