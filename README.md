@@ -128,8 +128,18 @@ Todas as rotas `/api/*` (exceto `/api/es/finalizar`) exigem `x-api-key: <API_SEC
 | `GET` | `/api/listar-grupos` | `?busca=` (mín. 3 letras, máx. 20 resultados, cache de 60s) |
 | `GET` | `/api/grupo-participantes` | `?groupId=` — números (LID resolvido) e quantos seguem ocultos |
 | `GET` | `/api/grupo-convite` | `?groupId=` — link `chat.whatsapp.com` (o auxiliar precisa ser admin) |
-| `POST` | `/api/adicionar-grupo` | `{ nomeGrupo, clientesPhones: [] }` |
+| `POST` | `/api/criar-grupo` | `{ nome, descricao?, somenteAdminsEnviam?, somenteAdminsEditam?, participantes: [] }` (máx. 50) → `groupId`, `link` de convite, `adicionados`, `naoAdicionados` (privacidade) e `avisos` |
+| `POST` | `/api/adicionar-grupo` | *(compatibilidade)* `{ nomeGrupo, clientesPhones: [] }` |
 | `POST` | `/api/adicionar-membros-grupo` | `{ groupId, clientesPhones: [] }` → inclui `bloqueadosPorPrivacidade` |
+
+### Contatos do aparelho auxiliar
+
+Vêm da agenda do celular onde o WhatsApp auxiliar está instalado (e das conversas do histórico inicial). O sidecar guarda **só nome e número** na coleção `contatos_wa` — nenhuma mensagem. Apagar a sessão apaga também esses contatos (eles voltam ao parear de novo).
+
+| Método | Rota | Payload / Query |
+| --- | --- | --- |
+| `GET` | `/api/contatos` | `?busca=&filtro=todos\|agenda\|conversa&limite=` — funciona mesmo com o WhatsApp offline |
+| `POST` | `/api/contatos/sincronizar` | Pede a agenda inteira ao celular de novo (para aparelhos pareados antes desta versão) |
 
 ### Fila de envio (anti-ban)
 

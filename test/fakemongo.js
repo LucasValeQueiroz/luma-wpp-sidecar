@@ -33,6 +33,7 @@ class Col {
   find(f){ let arr = this.docs.filter(x => match(x, f)); const api = { sort(s){ arr = arr.slice().sort(sorter(s)); return api; }, limit(n){ arr = arr.slice(0, n); return api; }, async toArray(){ return arr.map(x => ({ ...x })); } }; return api; }
   async findOneAndUpdate(f, u, o){ const c = this.docs.filter(x => match(x, f)).sort(sorter(o && o.sort)); if (!c.length) return null; applyUpd(c[0], u); return { ...c[0] }; }
   async updateOne(f, u){ const d = this.docs.find(x => match(x, f)); if (d) applyUpd(d, u); return { modifiedCount: d ? 1 : 0 }; }
+  async bulkWrite(ops){ for (const op of ops) { if (op.replaceOne) await this.replaceOne(op.replaceOne.filter, op.replaceOne.replacement); else if (op.deleteOne) await this.deleteOne(op.deleteOne.filter); else throw new Error('bulk op'); } return {}; }
   async updateMany(f, u){ const ds = this.docs.filter(x => match(x, f)); ds.forEach(d => applyUpd(d, u)); return { modifiedCount: ds.length }; }
   async replaceOne(f, doc, o){ const i = this.docs.findIndex(x => match(x, f)); if (i >= 0) this.docs[i] = { ...doc }; else this.docs.push({ ...doc }); return {}; }
   async deleteOne(f){ const i = this.docs.findIndex(x => match(x, f)); if (i >= 0) this.docs.splice(i, 1); return {}; }

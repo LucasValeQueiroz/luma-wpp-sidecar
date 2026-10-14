@@ -26,6 +26,11 @@ function makeWASocket(opts) {
     groupParticipantsUpdate: async (g, p) => p.map((j, i) => ({ jid: j, status: i === 0 ? '200' : '403' })),
     groupInviteCode: async () => 'ABC123',
     sendMessage: async (jid, content) => { const id = 'MSG' + (enviados.length + 1); enviados.push({ jid, content, t: Date.now(), id }); return { key: { id, remoteJid: jid, fromMe: true }, message: { conversation: content.text || content.caption || '' } }; },
+    user: { id: '5537900000000:7@s.whatsapp.net' },
+    groupUpdateDescription: async () => {},
+    groupSettingUpdate: async (g, setting) => { if (setting === 'locked') throw new Error('not-authorized'); },
+    authState: { keys: { set: async (d) => { s.chavesZeradas = d; } } },
+    resyncAppState: async () => { ev.emit('contacts.upsert', [{ id: '5531977778888@s.whatsapp.net', name: 'Maria Agenda' }, { id: '5531900000001@s.whatsapp.net' }]); },
     logout: async () => {},
     end: () => { ev.emit('connection.update', { connection: 'close', lastDisconnect: { error: { output: { statusCode: 428 } } } }); }
   };
@@ -184,6 +189,53 @@ async function esperar(cond, ms = 8000) { const t = Date.now(); while (Date.now(
   console.log('bloqueados por privacidade:', r.j.bloqueadosPorPrivacidade);
   r = await get('/api/listar-grupos?busca=vip'); assert.equal(r.j.grupos.length, 1);
   r = await get('/api/health'); console.log('health:', JSON.stringify(r.j).slice(0, 300));
+
+  // 15) contatos do aparelho: agenda (app-state), conversas (histórico) e nome de perfil
+  sockAtual.ev.emit('contacts.upsert', [
+    { id: '5511911112222@s.whatsapp.net', name: 'Ana Cliente' },
+    { id: '5537900000000@s.whatsapp.net', name: 'Eu mesmo' },          // o próprio número: ignorado
+    { id: 'grupo@g.us', name: 'Grupo' },                               // grupo: ignorado
+    { id: '999@lid', name: 'João Lid' }                                // LID resolvido pelo mapeamento
+  ]);
+  sockAtual.ev.emit('messaging-history.set', { contacts: [
+    { id: '5521977776666@s.whatsapp.net', name: 'Chat Sem Agenda' },
+    { id: '5511911112222@s.whatsapp.net', name: 'Nome do Chat' }      // não sobrescreve o nome da agenda
+  ] });
+  await sleep(100);
+  sockAtual.ev.emit('contacts.update', [
+    { id: '5511911112222@s.whatsapp.net', notify: 'Aninha' },
+    { id: '5599911112222@s.whatsapp.net', notify: 'Desconhecido' }    // não vira contato
+  ]);
+  await sleep(100);
+  r = await get('/api/contatos');
+  console.log('contatos:', r.j.contatos.map(c => `${c.nome || c.notify}=${c.numero}${c.agenda ? '[agenda]' : ''}${c.conversa ? '[conversa]' : ''}`));
+  assert.equal(r.j.comNumero, 3);
+  const ana = r.j.contatos.find(c => c.numero === '5511911112222');
+  assert.equal(ana.nome, 'Ana Cliente'); assert.equal(ana.notify, 'Aninha'); assert.ok(ana.agenda && ana.conversa);
+  assert.ok(r.j.contatos.some(c => c.numero === '5537988887777' && c.nome === 'João Lid'));
+  r = await get('/api/contatos?busca=joao'); assert.equal(r.j.encontrados, 1);
+  r = await get('/api/contatos?busca=7777'); assert.equal(r.j.contatos[0].numero, '5521977776666');
+  r = await get('/api/contatos?filtro=agenda'); assert.equal(r.j.encontrados, 2);
+  await srv._interno.gravarContatosPendentes();
+  assert.equal(fakeMongo._dbs.whatsapp_auth.cols.contatos_wa.docs.length, 3);
+
+  // 16) sincronizar agenda força o snapshot da coleção da agenda (contato sem nome é ignorado)
+  r = await post('/api/contatos/sincronizar', {});
+  console.log('sincronizar:', r.j.message);
+  assert.equal(r.j.status, 'success'); assert.equal(r.j.novos, 1);
+  assert.deepEqual(sockAtual.chavesZeradas, { 'app-state-sync-version': { critical_unblock_low: null } });
+
+  // 17) criar grupo completo: descrição, permissões, convite e quem não entrou
+  r = await post('/api/criar-grupo', { nome: 'Ofertas VIP', descricao: 'Só ofertas', somenteAdminsEnviam: true, somenteAdminsEditam: true,
+                                       participantes: ['5511911112222', '(55) 99 99999-0000', '5537900000000', '123'] });
+  console.log('criar-grupo:', JSON.stringify(r.j));
+  assert.equal(r.j.status, 'success'); assert.equal(r.j.groupId, 'novo@g.us');
+  assert.equal(r.j.link, 'https://chat.whatsapp.com/ABC123');
+  assert.equal(r.j.adicionados, 1); assert.deepEqual(r.j.naoAdicionados, ['5599999990000']);
+  assert.equal(r.j.avisos.length, 1);   // "locked" falhou, mas o grupo foi criado
+  r = await post('/api/criar-grupo', { nome: '' }); assert.equal(r.code, 500);
+  r = await post('/api/criar-grupo', { nome: 'X', participantes: Array.from({ length: 51 }, (_, i) => '55119' + String(i).padStart(8, '0')) });
+  assert.equal(r.code, 500); console.log('teto de participantes:', r.j.message);
 
   console.log('\n✅ TODOS OS TESTES DO SIDECAR PASSARAM');
   gasSrv.close(); process.exit(0);

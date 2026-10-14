@@ -38,6 +38,11 @@
  *  5) EMBEDDED SIGNUP (Coexistence) montado ANTES do guard da API,
  *     porque /conectar e /api/es/finalizar são chamados pelo navegador.
  *
+ *  6) CONTATOS DO APARELHO + CRIAÇÃO COMPLETA DE GRUPO
+ *     A agenda do celular auxiliar (só nome e número — nenhuma mensagem)
+ *     fica disponível em /api/contatos para o painel montar grupos.
+ *     /api/criar-grupo cria com descrição, permissões e link de convite.
+ *
  *  ---------------------------------------------------------------------
  *  VARIÁVEIS DE AMBIENTE (Render → Environment) — veja .env.example
  *  ---------------------------------------------------------------------
@@ -74,6 +79,7 @@ const COL_ENTRADA_CFG = 'entrada_config';
 const COL_ENTRADA_FILA = 'entrada_fila';
 const COL_ENVIO_FILA = 'envio_fila';
 const COL_ENVIO_CFG = 'envio_config';
+const COL_CONTATOS = 'contatos_wa';
 
 const TZ_ENVIO = process.env.TZ_ENVIO || 'America/Sao_Paulo';
 const DIA_MS = 24 * 60 * 60 * 1000;
@@ -87,6 +93,7 @@ let colEntradaCfg;
 let colEntradaFila;
 let colEnvioFila;
 let colEnvioCfg;
+let colContatos;
 let reconnectTimeout;
 let conectando = false;             // trava contra reconexões sobrepostas
 let encerrando = false;             // SIGTERM recebido: não reconecta mais
@@ -290,6 +297,132 @@ function guardarMensagemEnviada(msg) {
         const primeiro = mensagensEnviadas.keys().next().value;
         mensagensEnviadas.delete(primeiro);
     }
+}
+
+// =====================================================================
+// CONTATOS DO APARELHO AUXILIAR
+// ---------------------------------------------------------------------
+// Ao parear, o WhatsApp manda para o aparelho conectado a agenda do
+// celular (nome salvo + número) e a lista de conversas. Guardamos SÓ
+// isso — nome, número e de onde veio — para o painel montar grupos.
+// Nenhuma mensagem é gravada. Ficam em memória (busca instantânea) e no
+// Mongo (sobrevivem ao reinício do Render).
+// =====================================================================
+const contatosWa = new Map();           // chave (telefone ou LID) -> contato
+const contatosAlterados = new Set();    // chaves a gravar no Mongo
+const contatosRemovidos = new Set();    // chaves a apagar (LID que virou telefone)
+let contatosAtualizadosEm = null;
+let sincronizandoContatos = false;
+const COLECAO_AGENDA = 'critical_unblock_low';   // coleção do app-state com a agenda
+
+const semAcento = (s) => String(s || '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase();
+const jidSemContato = (jid) => /@(g\.us|broadcast|newsletter)$/.test(jid);
+
+/**
+ * Junta contatos vindos do WhatsApp ao cadastro em memória.
+ * origem: 'agenda' (nome salvo no celular) | 'conversa' (histórico de chats)
+ */
+async function registrarContatos(lista, origem) {
+    if (!Array.isArray(lista) || !lista.length) return 0;
+    const meuNumero = numeroDoJid(sock && sock.user && sock.user.id);
+    let alterados = 0;
+
+    for (const c of lista) {
+        const id = String((c && c.id) || '');
+        if (!id || jidSemContato(id)) continue;
+        const lid = String(c.lid || (id.endsWith('@lid') ? id : ''));
+        let numero = numeroDoJid(c.phoneNumber) || numeroDoJid(id);
+        if (!numero && lid) numero = await resolverTelefone(lid);
+        if (numero && (numero === meuNumero || numero.length < 8 || numero.length > 15)) continue;
+        const chave = numero || lid;
+        if (!chave) continue;
+
+        const nome = String(c.name || '').trim();
+        // Agenda sem nome = contato removido do celular: não cria cadastro novo.
+        const conhecido = contatosWa.has(chave) || (lid && contatosWa.has(lid));
+        if (origem === 'agenda' && !nome && !c.notify && !conhecido) continue;
+
+        let atual = contatosWa.get(chave);
+        // Contato que antes só tinha LID e agora tem telefone: troca de chave.
+        if (!atual && numero && lid && contatosWa.has(lid)) {
+            atual = contatosWa.get(lid);
+            contatosWa.delete(lid);
+            contatosAlterados.delete(lid);
+            contatosRemovidos.add(lid);
+        }
+        atual = atual || { _id: chave, numero: '', lid: '', nome: '', notify: '', agenda: false, conversa: false };
+
+        const novo = {
+            ...atual,
+            _id: chave,
+            numero: numero || atual.numero,
+            lid: lid || atual.lid,
+            notify: String(c.notify || '').trim() || atual.notify
+        };
+        if (origem === 'agenda' && nome) { novo.nome = nome; novo.agenda = true; }
+        if (origem === 'conversa') {
+            novo.conversa = true;
+            if (nome && !atual.agenda) novo.nome = nome;   // nome da agenda tem prioridade
+        }
+
+        if (JSON.stringify(novo) !== JSON.stringify(atual)) {
+            contatosWa.set(chave, novo);
+            contatosAlterados.add(chave);
+            alterados++;
+        }
+    }
+    if (alterados) contatosAtualizadosEm = new Date();
+    return alterados;
+}
+
+// contacts.update chega a cada mensagem recebida (nome de perfil). Só
+// atualiza quem já está no cadastro — senão todo membro de todo grupo
+// viraria "contato".
+function atualizarNomesDePerfil(lista) {
+    for (const u of (lista || [])) {
+        if (!u || !u.notify) continue;
+        const chave = numeroDoJid(u.id) || String(u.id || '');
+        const atual = contatosWa.get(chave);
+        if (!atual || atual.notify === u.notify) continue;
+        contatosWa.set(chave, { ...atual, notify: String(u.notify) });
+        contatosAlterados.add(chave);
+    }
+}
+
+async function gravarContatosPendentes() {
+    if (!colContatos || (!contatosAlterados.size && !contatosRemovidos.size)) return;
+    const ops = [];
+    for (const chave of contatosRemovidos) ops.push({ deleteOne: { filter: { _id: chave } } });
+    for (const chave of contatosAlterados) {
+        const c = contatosWa.get(chave);
+        if (c) ops.push({ replaceOne: { filter: { _id: chave }, replacement: { ...c, atualizadoEm: new Date() }, upsert: true } });
+    }
+    contatosRemovidos.clear();
+    contatosAlterados.clear();
+    try {
+        for (let i = 0; i < ops.length; i += 500) await colContatos.bulkWrite(ops.slice(i, i + 500), { ordered: false });
+    } catch (e) {
+        console.warn('⚠️ Falha ao gravar contatos no Mongo:', e.message);
+    }
+}
+
+async function carregarContatosSalvos() {
+    contatosWa.clear();
+    const docs = await colContatos.find({}).toArray();
+    docs.forEach(d => contatosWa.set(String(d._id), {
+        _id: String(d._id), numero: d.numero || '', lid: d.lid || '', nome: d.nome || '',
+        notify: d.notify || '', agenda: !!d.agenda, conversa: !!d.conversa
+    }));
+    if (docs.length) console.log(`📇 ${docs.length} contato(s) do aparelho carregados.`);
+}
+
+// Sessão apagada ou deslogada: os contatos eram daquele número.
+async function apagarContatosDoAparelho() {
+    contatosWa.clear();
+    contatosAlterados.clear();
+    contatosRemovidos.clear();
+    contatosAtualizadosEm = null;
+    if (colContatos) await colContatos.deleteMany({});
 }
 
 // =====================================================================
@@ -951,6 +1084,9 @@ function encerrarSocketAntigo() {
         sock.ev.removeAllListeners('messages.upsert');
         sock.ev.removeAllListeners('groups.update');
         sock.ev.removeAllListeners('group-participants.update');
+        sock.ev.removeAllListeners('contacts.upsert');
+        sock.ev.removeAllListeners('contacts.update');
+        sock.ev.removeAllListeners('messaging-history.set');
     } catch (e) { /* silencioso */ }
     // Fecha de verdade o websocket anterior. Só remover os listeners deixava
     // o socket velho vivo, brigando com o novo pela mesma sessão (erro 440).
@@ -1067,6 +1203,7 @@ async function conectarInterno() {
                 // Sessão inválida: limpa e reconecta para emitir um QR novo.
                 console.log('🧹 Sessão inválida/deslogada. Limpando e gerando QR novo...');
                 await mongoCollection.deleteMany({});
+                await apagarContatosDoAparelho();
             }
             reconnectTimeout = setTimeout(connectToWhatsApp, espera);
         } else if (connection === 'open') {
@@ -1080,6 +1217,16 @@ async function conectarInterno() {
     });
 
     sock.ev.on('creds.update', saveCreds);
+
+    // 📇 Contatos: agenda do celular (app-state) e conversas do histórico inicial.
+    // Do histórico só aproveitamos quem é o contato — as mensagens são descartadas.
+    sock.ev.on('contacts.upsert', (lista) => {
+        registrarContatos(lista, 'agenda').catch(e => console.warn('⚠️ contatos (agenda):', e.message));
+    });
+    sock.ev.on('contacts.update', atualizarNomesDePerfil);
+    sock.ev.on('messaging-history.set', ({ contacts }) => {
+        registrarContatos(contacts, 'conversa').catch(e => console.warn('⚠️ contatos (conversas):', e.message));
+    });
 
     // Metadados mudaram (nome, participantes): invalida o cache daquele grupo.
     sock.ev.on('groups.update', (updates) => {
@@ -1253,6 +1400,153 @@ app.get('/api/grupo-convite', async (req, res) => {
         res.json({ status: 'success', link: 'https://chat.whatsapp.com/' + code });
     } catch (error) {
         res.status(500).json({ status: 'error', message: error.toString() });
+    }
+});
+
+// Criação completa: nome, descrição, permissões e link de convite numa chamada só.
+// Teto de participantes por vez: adicionar muita gente de uma vez é o que mais
+// derruba número — o resto entra pelo link de convite.
+const MAX_PARTICIPANTES_CRIACAO = 50;
+app.post('/api/criar-grupo', async (req, res) => {
+    try {
+        if (!isConnected) throw new Error('WhatsApp deslogado.');
+        const b = req.body || {};
+        const nome = String(b.nome || '').trim();
+        const descricao = String(b.descricao || '').trim();
+        if (!nome) throw new Error('Informe o nome do grupo.');
+        if (nome.length > 100) throw new Error('O nome do grupo pode ter no máximo 100 caracteres.');
+        if (descricao.length > 2048) throw new Error('A descrição pode ter no máximo 2048 caracteres.');
+
+        const meuNumero = numeroDoJid(sock.user && sock.user.id);
+        const numeros = [...new Set((Array.isArray(b.participantes) ? b.participantes : [])
+            .map(soDigitos).filter(n => n.length >= 10 && n.length <= 15 && n !== meuNumero))];
+        if (numeros.length > MAX_PARTICIPANTES_CRIACAO) {
+            throw new Error(`No máximo ${MAX_PARTICIPANTES_CRIACAO} participantes por vez. Convide o resto pelo link do grupo.`);
+        }
+
+        let grupo;
+        try {
+            grupo = await sock.groupCreate(nome, numeros.map(n => `${n}@s.whatsapp.net`));
+        } catch (e) {
+            if (!numeros.length) throw new Error('O WhatsApp exigiu pelo menos 1 participante. Adicione 1 pessoa (pode ser o seu número pessoal) e convide o resto pelo link. Detalhe: ' + e.message);
+            throw e;
+        }
+        const groupId = grupo.id;
+        cacheListaGrupos.ts = 0;   // a busca seguinte já enxerga o grupo novo
+
+        // Ajustes opcionais: se um falhar o grupo já existe, então só avisa.
+        const avisos = [];
+        const tentar = async (rotulo, fn) => { try { await fn(); } catch (e) { avisos.push(`${rotulo}: ${e.message}`); } };
+        if (descricao) await tentar('Descrição', () => sock.groupUpdateDescription(groupId, descricao));
+        if (b.somenteAdminsEnviam) await tentar('Só admins enviam', () => sock.groupSettingUpdate(groupId, 'announcement'));
+        if (b.somenteAdminsEditam) await tentar('Só admins editam', () => sock.groupSettingUpdate(groupId, 'locked'));
+
+        let link = '';
+        await tentar('Link de convite', async () => {
+            const code = await sock.groupInviteCode(groupId);
+            if (code) link = 'https://chat.whatsapp.com/' + code;
+        });
+
+        // Quem não entrou costuma ser privacidade ("quem pode me adicionar").
+        let naoAdicionados = [];
+        await tentar('Conferência de membros', async () => {
+            const meta = await metadadosGrupo(groupId, true);
+            const dentro = new Set();
+            for (const p of (meta.participants || [])) {
+                const n = await resolverTelefone(p.phoneNumber || p.id, p.id);
+                if (n) dentro.add(n);
+            }
+            naoAdicionados = numeros.filter(n => !dentro.has(n));
+        });
+
+        res.json({
+            status: 'success',
+            groupId,
+            nome,
+            link,
+            adicionados: numeros.length - naoAdicionados.length,
+            naoAdicionados,
+            avisos
+        });
+    } catch (error) {
+        res.status(500).json({ status: 'error', message: error.message || String(error) });
+    }
+});
+
+// ---------- CONTATOS DO APARELHO ----------
+
+// Lista os contatos sincronizados (funciona mesmo com o WhatsApp offline).
+app.get('/api/contatos', (req, res) => {
+    const busca = semAcento(String(req.query.busca || '').trim());
+    const digitos = soDigitos(busca);
+    const filtro = String(req.query.filtro || 'todos');
+    const limite = Math.min(5000, Math.max(1, parseInt(req.query.limite, 10) || 500));
+
+    const todos = [...contatosWa.values()];
+    const comNumero = todos.filter(c => c.numero);
+    let lista = comNumero;
+    if (filtro === 'agenda') lista = lista.filter(c => c.agenda);
+    else if (filtro === 'conversa') lista = lista.filter(c => c.conversa);
+    if (busca) {
+        lista = lista.filter(c => semAcento(c.nome + ' ' + c.notify).includes(busca) ||
+                                  (digitos.length >= 3 && c.numero.includes(digitos)));
+    }
+    const rotulo = (c) => semAcento(c.nome || c.notify || '~' + c.numero);
+    lista.sort((a, b) => rotulo(a).localeCompare(rotulo(b)));
+
+    res.json({
+        status: 'success',
+        conectado: isConnected,
+        total: todos.length,
+        comNumero: comNumero.length,
+        semNumero: todos.length - comNumero.length,
+        naAgenda: comNumero.filter(c => c.agenda).length,
+        encontrados: lista.length,
+        atualizadoEm: contatosAtualizadosEm,
+        contatos: lista.slice(0, limite).map(c => ({
+            numero: c.numero, nome: c.nome, notify: c.notify, agenda: c.agenda, conversa: c.conversa
+        }))
+    });
+});
+
+// Pede ao celular a agenda inteira de novo (útil se o aparelho foi pareado
+// antes desta versão, quando os contatos ainda não eram guardados).
+app.post('/api/contatos/sincronizar', async (req, res) => {
+    if (!isConnected) return res.status(500).json({ status: 'error', message: 'WhatsApp deslogado.' });
+    if (sincronizandoContatos) {
+        return res.status(409).json({ status: 'error', message: 'Já existe uma sincronização em andamento. Aguarde alguns segundos.' });
+    }
+    sincronizandoContatos = true;
+    try {
+        const antes = [...contatosWa.values()].filter(c => c.numero).length;
+
+        // Sem versão salva, o WhatsApp devolve o snapshot completo da coleção.
+        await sock.authState.keys.set({ 'app-state-sync-version': { [COLECAO_AGENDA]: null } });
+        // Pode passar dos 40s da resposta: segue em segundo plano, sem nunca
+        // deixar uma rejeição solta (derrubaria o processo).
+        let erroSync = null;
+        const sync = sock.resyncAppState([COLECAO_AGENDA], true)
+            .then(() => true, (e) => { erroSync = e; return true; })
+            .finally(() => { sincronizandoContatos = false; gravarContatosPendentes(); });
+        const terminou = await Promise.race([sync, dormir(40000).then(() => false)]);
+        if (erroSync) throw erroSync;
+        await dormir(300);   // os eventos saem do buffer logo depois do resync
+        await gravarContatosPendentes();
+
+        const depois = [...contatosWa.values()].filter(c => c.numero).length;
+        res.json({
+            status: 'success',
+            concluido: terminou,
+            antes,
+            depois,
+            novos: Math.max(0, depois - antes),
+            message: terminou
+                ? `${depois} contato(s) com número (${Math.max(0, depois - antes)} novo(s)).`
+                : 'O celular ainda está enviando a agenda. Atualize a lista em 1 minuto.'
+        });
+    } catch (error) {
+        sincronizandoContatos = false;
+        res.status(500).json({ status: 'error', message: 'Não consegui sincronizar a agenda: ' + (error.message || String(error)) });
     }
 });
 
@@ -1445,6 +1739,7 @@ app.post('/api/resetar-sessao', async (req, res) => {
         try { if (sock) sock.end(undefined); } catch (e) { /* ignora */ }
 
         await mongoCollection.deleteMany({});
+        await apagarContatosDoAparelho();   // voltam sozinhos ao parear de novo
         isConnected = false;
         qrCodeBase64 = '';
         quedasSeguidas = 0;
@@ -1480,6 +1775,8 @@ async function prepararColecoes(db) {
     colEntradaFila = db.collection(COL_ENTRADA_FILA);
     colEnvioFila = db.collection(COL_ENVIO_FILA);
     colEnvioCfg = db.collection(COL_ENVIO_CFG);
+    colContatos = db.collection(COL_CONTATOS);
+    try { await carregarContatosSalvos(); } catch (e) { console.warn('⚠️ Contatos do aparelho não carregados:', e.message); }
 
     const indices = [
         colEnvioFila.createIndex({ status: 1, prioridade: -1, criadoEm: 1 }),
@@ -1538,6 +1835,7 @@ async function startServer() {
         connectToWhatsApp();
         timers.push(setInterval(processarFilaPendente, 60 * 1000));   // reenvio de entradas ao Apps Script
         timers.push(setInterval(cicloFilaEnvio, 3000));               // fila de publicação anti-ban
+        timers.push(setInterval(gravarContatosPendentes, 5000));      // contatos do aparelho → Mongo
 
         // 🐕 WATCHDOG: 2 minutos sem conexão e sem QR = algo travou no meio do caminho.
         timers.push(setInterval(() => {
@@ -1563,6 +1861,7 @@ async function encerrar(sinal) {
     const limite = Date.now() + 8000;
     while (workerEnvioRodando && Date.now() < limite) await dormir(200);
     try { if (sock) sock.end(undefined); } catch (e) { /* ignora */ }
+    await gravarContatosPendentes();
     try { if (mongoClient) await mongoClient.close(); } catch (e) { /* ignora */ }
     process.exit(0);
 }
@@ -1574,4 +1873,4 @@ if (require.main === module) {
     startServer();
 }
 
-module.exports = { app, _interno: { startServer, validarItemFila, dentroDaJanela, validarCfgEnvio, horaLocal, numeroDoJid, RE_INTERESSE, estado: () => ({ isConnected, cfgEnvio, estadoEnvio }) } };
+module.exports = { app, _interno: { startServer, validarItemFila, dentroDaJanela, validarCfgEnvio, horaLocal, numeroDoJid, RE_INTERESSE, gravarContatosPendentes, estado: () => ({ isConnected, cfgEnvio, estadoEnvio }) } };
