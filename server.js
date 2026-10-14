@@ -61,7 +61,8 @@ const {
     BufferJSON,
     downloadMediaMessage,
     fetchLatestWaWebVersion,
-    jidNormalizedUser
+    jidNormalizedUser,
+    S_WHATSAPP_NET
 } = require('@whiskeysockets/baileys');
 const { MongoClient, ObjectId } = require('mongodb');
 const qrcode = require('qrcode');
@@ -83,6 +84,9 @@ const COL_ENVIO_CFG = 'envio_config';
 const COL_CONTATOS = 'contatos_wa';
 
 const TZ_ENVIO = process.env.TZ_ENVIO || 'America/Sao_Paulo';
+// O Render informa o commit publicado; aparece no /ping para conferir se o deploy entrou.
+const VERSAO_PUBLICADA = String(process.env.RENDER_GIT_COMMIT || '').slice(0, 7) || 'local';
+let processadorImagem = 'verificando';   // sharp carregou? (aparece no /ping e no /api/health)
 const DIA_MS = 24 * 60 * 60 * 1000;
 
 let sock;
@@ -200,7 +204,8 @@ function apiKeyGuard(req, res, next) {
  * a sessão do WhatsApp. Não devolve nada sensível.
  */
 app.get('/ping', (req, res) => {
-    res.json({ ok: true, conectado: isConnected });
+    // versão (commit que o Render publicou) e foto: para saber de fora se o deploy entrou.
+    res.json({ ok: true, conectado: isConnected, versao: VERSAO_PUBLICADA, foto: processadorImagem });
 });
 
 // =====================================================================
@@ -1280,6 +1285,8 @@ app.get('/api/health', async (req, res) => {
     res.json({
         status: 'ok',
         versao: 3,
+        commit: VERSAO_PUBLICADA,
+        processadorImagem,
         conectado: isConnected,
         gruposEscutando: entradaGruposSet.size,
         gruposComResposta: respostaGruposMap.size,
@@ -1421,6 +1428,45 @@ const JANELA_REPETICAO_MS = 3 * 60 * 1000;
 
 // Foto de grupo: o painel já manda 640x640 em JPEG; o Baileys (com sharp) só ajusta.
 const MAX_FOTO_BYTES = 5 * 1024 * 1024;
+const ESPERA_FOTO_MS = numEnv(process.env.FOTO_ESPERA_MS, 1500);
+
+async function verificarProcessadorImagem() {
+    try {
+        const m = await import('sharp');
+        const sharp = m.default || m;
+        processadorImagem = 'sharp ' + ((sharp.versions && sharp.versions.sharp) || '');
+    } catch (e) {
+        processadorImagem = 'indisponível (' + String(e.message || e).split('\n')[0].slice(0, 120) + ')';
+    }
+    console.log('🖼️ Processador de imagem: ' + processadorImagem);
+}
+
+const ehJpeg = (buf) => buf.length > 3 && buf[0] === 0xFF && buf[1] === 0xD8 && buf[2] === 0xFF;
+
+// Foto do grupo pelo caminho do Baileys (sharp redimensiona). Se falhar, o painel já
+// mandou 640x640 em JPEG: envia direto ao WhatsApp, sem depender do sharp.
+async function definirFotoGrupo(groupId, buf) {
+    try {
+        await sock.updateProfilePicture(groupId, buf);
+        return 'baileys';
+    } catch (e) {
+        console.warn(`⚠️ Foto do grupo ${groupId} pelo Baileys falhou: ${e.message}`);
+        if (!ehJpeg(buf)) throw e;
+        try {
+            await sock.query({
+                tag: 'iq',
+                attrs: { target: groupId, to: S_WHATSAPP_NET, type: 'set', xmlns: 'w:profile:picture' },
+                content: [{ tag: 'picture', attrs: { type: 'image' }, content: buf }]
+            });
+            console.log(`🖼️ Foto do grupo ${groupId} enviada direto (JPEG do painel).`);
+            return 'direto';
+        } catch (e2) {
+            console.warn(`⚠️ Foto do grupo ${groupId} enviada direto também falhou: ${e2.message}`);
+            throw e2;
+        }
+    }
+}
+
 function bufferDaImagem(base64) {
     const limpo = String(base64 || '').replace(/^data:[^;]+;base64,/, '');
     const buf = Buffer.from(limpo, 'base64');
@@ -1452,7 +1498,23 @@ async function criarGrupoCompleto({ nome, descricao, numeros, somenteAdminsEnvia
     // Ajustes opcionais: se um falhar o grupo já existe, então só avisa.
     const avisos = [];
     const tentar = async (rotulo, fn) => { try { await fn(); } catch (e) { avisos.push(`${rotulo}: ${e.message}`); } };
-    if (foto) await tentar('Foto do grupo', () => sock.updateProfilePicture(groupId, foto));
+
+    // Logo depois de criar, o WhatsApp às vezes ainda recusa mudar o grupo: espera um pouco
+    // e tenta duas vezes. null = não pediram foto; false = pediram e não entrou.
+    let fotoAplicada = null;
+    if (foto) {
+        fotoAplicada = false;
+        await dormir(ESPERA_FOTO_MS);
+        for (let tentativa = 1; tentativa <= 2 && !fotoAplicada; tentativa++) {
+            try {
+                await definirFotoGrupo(groupId, foto);
+                fotoAplicada = true;
+            } catch (e) {
+                if (tentativa === 2) avisos.push('Foto do grupo: ' + mensagemErroGrupo(e));
+                else await dormir(ESPERA_FOTO_MS * 2);
+            }
+        }
+    }
     if (descricao) await tentar('Descrição', () => sock.groupUpdateDescription(groupId, descricao));
     if (somenteAdminsEnviam) await tentar('Só admins enviam', () => sock.groupSettingUpdate(groupId, 'announcement'));
     if (somenteAdminsEditam) await tentar('Só admins editam', () => sock.groupSettingUpdate(groupId, 'locked'));
@@ -1482,6 +1544,7 @@ async function criarGrupoCompleto({ nome, descricao, numeros, somenteAdminsEnvia
         link,
         adicionados: numeros.length - naoAdicionados.length,
         naoAdicionados,
+        fotoAplicada,
         avisos
     };
 }
@@ -1603,7 +1666,7 @@ app.post('/api/grupo-foto', async (req, res) => {
         const b = req.body || {};
         const groupId = groupIdValido(b.groupId);
         if (b.remover) await sock.removeProfilePicture(groupId);
-        else await sock.updateProfilePicture(groupId, bufferDaImagem(b.imagemBase64));
+        else await definirFotoGrupo(groupId, bufferDaImagem(b.imagemBase64));
         let foto = '';
         if (!b.remover) {
             try { foto = (await sock.profilePictureUrl(groupId, 'image', 8000)) || ''; } catch (e) { /* ainda processando */ }
@@ -2060,6 +2123,7 @@ async function startServer() {
     const db = mongoClient.db(DBNAME);
     app.locals.db = db;
     await prepararColecoes(db);
+    verificarProcessadorImagem();   // só registra no log/ping se o sharp carregou; não bloqueia
     console.log('📦 Conectado ao MongoDB com sucesso!');
 
     await carregarConfigEntrada();

@@ -7,6 +7,7 @@ process.env.PORT = '3999';
 process.env.ENVIO_INTERVALO_MIN_SEG = '0.2';
 process.env.ENVIO_INTERVALO_MAX_SEG = '0.3';
 process.env.ENVIO_DIGITANDO_SEG = '0';
+process.env.FOTO_ESPERA_MS = '0';
 const Module = require('module');
 const EventEmitter = require('events');
 const real = require('@whiskeysockets/baileys');
@@ -34,7 +35,16 @@ function makeWASocket(opts) {
     user: { id: '5537900000000:7@s.whatsapp.net' },
     groupUpdateDescription: async () => {},
     fotos: {},
-    updateProfilePicture: async (jid, buf) => { if (!Buffer.isBuffer(buf) || !buf.length) throw new Error('imagem'); s.fotos[jid] = buf.length; },
+    updateProfilePicture: async (jid, buf) => {
+      if (s.semSharp) throw new Error('No image processing library available');
+      if (s.falharFotoUmaVez) { s.falharFotoUmaVez = false; throw new Error('not-acceptable'); }
+      if (!Buffer.isBuffer(buf) || !buf.length) throw new Error('imagem');
+      s.fotos[jid] = buf.length;
+    },
+    query: async (no) => {   // envio direto da foto (quando o sharp não está disponível)
+      if (no.attrs.xmlns !== 'w:profile:picture') throw new Error('query inesperada');
+      s.fotos[no.attrs.target] = no.content[0].content.length; s.fotoDireta = no.attrs.target;
+    },
     removeProfilePicture: async (jid) => { delete s.fotos[jid]; },
     profilePictureUrl: async (jid) => { if (!s.fotos[jid]) throw new Error('item-not-found'); return 'https://pps.whatsapp.net/' + jid + '.jpg'; },
     groupUpdateSubject: async (jid, nome) => { if (jid === 'semadmin@g.us') throw new Error('not-authorized'); },
@@ -275,6 +285,26 @@ async function esperar(cond, ms = 8000) { const t = Date.now(); while (Date.now(
   const fotoB64 = Buffer.from('jpeg-de-mentira').toString('base64');
   r = await post('/api/criar-grupo', { nome: 'Com Foto', fotoBase64: 'data:image/jpeg;base64,' + fotoB64, chave: 'k-foto' });
   assert.equal(r.j.status, 'success'); assert.ok(sockAtual.fotos[r.j.groupId], 'foto aplicada no grupo novo');
+  assert.equal(r.j.fotoAplicada, true);
+  // sem foto pedida: fotoAplicada null
+  r = await post('/api/criar-grupo', { nome: 'Sem Foto', chave: 'k-sem-foto' }); assert.equal(r.j.fotoAplicada, null);
+  // sharp indisponível no servidor: a foto (JPEG do painel) vai direto ao WhatsApp
+  const jpeg = Buffer.concat([Buffer.from([0xFF, 0xD8, 0xFF, 0xE0]), Buffer.from('resto-do-jpeg')]).toString('base64');
+  sockAtual.semSharp = true;
+  r = await post('/api/criar-grupo', { nome: 'Foto Direta', fotoBase64: jpeg, chave: 'k-foto-direta' });
+  assert.equal(r.j.fotoAplicada, true); assert.equal(sockAtual.fotoDireta, r.j.groupId);
+  // ...mas se não for JPEG não dá para mandar direto: avisa com o motivo
+  r = await post('/api/criar-grupo', { nome: 'Foto PNG', fotoBase64: fotoB64, chave: 'k-foto-png' });
+  assert.equal(r.j.status, 'success'); assert.equal(r.j.fotoAplicada, false);
+  assert.ok(r.j.avisos.some(a => /Foto do grupo/.test(a))); console.log('foto sem sharp e sem JPEG:', r.j.avisos.join(' | '));
+  sockAtual.semSharp = false;
+  // WhatsApp recusou logo após criar: a 2ª tentativa entra
+  sockAtual.falharFotoUmaVez = true;
+  r = await post('/api/criar-grupo', { nome: 'Foto 2a Tentativa', fotoBase64: fotoB64, chave: 'k-foto-retry' });
+  assert.equal(r.j.fotoAplicada, true); assert.equal(r.j.avisos.length, 0);
+  // /ping diz a versão publicada e se o sharp carregou
+  const ping = await fetch(B + '/ping').then(x => x.json());
+  console.log('ping:', JSON.stringify(ping)); assert.ok(ping.versao && ping.foto);
   const criadosAntesFoto = sockAtual.criados;
   r = await post('/api/criar-grupo', { nome: 'Foto Ruim', fotoBase64: '!!!', chave: 'k-foto-ruim' });
   assert.equal(r.code, 500); assert.equal(sockAtual.criados, criadosAntesFoto);
@@ -299,6 +329,10 @@ async function esperar(cond, ms = 8000) { const t = Date.now(); while (Date.now(
   r = await post('/api/grupo-foto', { groupId: 'a@g.us', remover: true }); assert.equal(r.j.status, 'success');
   assert.ok(!sockAtual.fotos['a@g.us']);
   r = await post('/api/grupo-foto', { groupId: 'a@g.us' }); assert.equal(r.code, 500);
+  sockAtual.semSharp = true; sockAtual.fotoDireta = '';
+  r = await post('/api/grupo-foto', { groupId: 'a@g.us', imagemBase64: jpeg });
+  assert.equal(r.j.status, 'success'); assert.equal(sockAtual.fotoDireta, 'a@g.us');
+  sockAtual.semSharp = false;
 
   // 22) editar: o que falha vira aviso, o resto é aplicado; sem admin a mensagem é clara
   r = await post('/api/grupo-editar', { groupId: 'a@g.us', nome: 'Clientes VIP 2', descricao: '', somenteAdminsEnviam: false, somenteAdminsEditam: true });
