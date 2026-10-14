@@ -22,7 +22,12 @@ function makeWASocket(opts) {
     sendPresenceUpdate: async () => {},
     groupMetadata: async (jid) => { if (jid === 'sumiu@g.us') throw new Error('item-not-found'); return { id: jid, subject: 'Grupo ' + jid, participants: [{ id: '5511911112222@s.whatsapp.net' }, { id: '999@lid' }, { id: '888@lid', phoneNumber: '5521977776666@s.whatsapp.net' }, { id: '777@lid' }] }; },
     groupFetchAllParticipating: async () => ({ 'a@g.us': { id: 'a@g.us', subject: 'Clientes VIP', participants: [1,2] } }),
-    groupCreate: async (n, p) => ({ id: 'novo@g.us' }),
+    groupCreate: async (n, p) => {
+      s.criados = (s.criados || 0) + 1;
+      await new Promise(r => setTimeout(r, 150));   // demora de propósito: pedidos repetidos chegam no meio
+      if (n === 'Falha Uma Vez' && s.criados === s.falharEm) throw new Error('timeout do WhatsApp');
+      return { id: 'novo' + s.criados + '@g.us' };
+    },
     groupParticipantsUpdate: async (g, p) => p.map((j, i) => ({ jid: j, status: i === 0 ? '200' : '403' })),
     groupInviteCode: async () => 'ABC123',
     sendMessage: async (jid, content) => { const id = 'MSG' + (enviados.length + 1); enviados.push({ jid, content, t: Date.now(), id }); return { key: { id, remoteJid: jid, fromMe: true }, message: { conversation: content.text || content.caption || '' } }; },
@@ -229,13 +234,36 @@ async function esperar(cond, ms = 8000) { const t = Date.now(); while (Date.now(
   r = await post('/api/criar-grupo', { nome: 'Ofertas VIP', descricao: 'Só ofertas', somenteAdminsEnviam: true, somenteAdminsEditam: true,
                                        participantes: ['5511911112222', '(55) 99 99999-0000', '5537900000000', '123'] });
   console.log('criar-grupo:', JSON.stringify(r.j));
-  assert.equal(r.j.status, 'success'); assert.equal(r.j.groupId, 'novo@g.us');
+  assert.equal(r.j.status, 'success'); assert.equal(r.j.groupId, 'novo1@g.us');
   assert.equal(r.j.link, 'https://chat.whatsapp.com/ABC123');
   assert.equal(r.j.adicionados, 1); assert.deepEqual(r.j.naoAdicionados, ['5599999990000']);
   assert.equal(r.j.avisos.length, 1);   // "locked" falhou, mas o grupo foi criado
   r = await post('/api/criar-grupo', { nome: '' }); assert.equal(r.code, 500);
   r = await post('/api/criar-grupo', { nome: 'X', participantes: Array.from({ length: 51 }, (_, i) => '55119' + String(i).padStart(8, '0')) });
   assert.equal(r.code, 500); console.log('teto de participantes:', r.j.message);
+
+  // 18) ANTI-DUPLICAÇÃO: o mesmo pedido chegando duas vezes cria UM grupo só
+  const criadosAntes = sockAtual.criados;
+  const pedido = { nome: 'Dup A', participantes: ['5511911112222'], chave: 'k-123' };
+  const [d1, d2] = await Promise.all([post('/api/criar-grupo', pedido), post('/api/criar-grupo', pedido)]);   // ao mesmo tempo
+  console.log('mesma chave, ao mesmo tempo:', d1.j.groupId, d2.j.groupId, 'repetido:', !!d1.j.repetido, !!d2.j.repetido);
+  assert.equal(sockAtual.criados - criadosAntes, 1);
+  assert.equal(d1.j.groupId, d2.j.groupId); assert.ok(d1.j.repetido || d2.j.repetido);
+  r = await post('/api/criar-grupo', pedido);   // a mesma chave depois de pronto
+  assert.equal(r.j.groupId, d1.j.groupId); assert.equal(sockAtual.criados - criadosAntes, 1);
+  // sem chave (painel antigo): nome + participantes iguais logo em seguida também é repetição
+  r = await post('/api/criar-grupo', { nome: 'Dup B', participantes: ['5511911112222'] });
+  const r2 = await post('/api/criar-grupo', { nome: 'dup b', participantes: ['5511911112222'] });
+  assert.equal(r.j.groupId, r2.j.groupId); assert.equal(sockAtual.criados - criadosAntes, 2);
+  // outro nome ou outras pessoas = grupo novo de verdade
+  r = await post('/api/criar-grupo', { nome: 'Dup B', participantes: ['5521977776666'] });
+  assert.equal(sockAtual.criados - criadosAntes, 3);
+  // se a primeira tentativa falhou, a mesma chave pode tentar de novo
+  sockAtual.falharEm = sockAtual.criados + 1;
+  r = await post('/api/criar-grupo', { nome: 'Falha Uma Vez', chave: 'k-falha' }); assert.equal(r.code, 500);
+  r = await post('/api/criar-grupo', { nome: 'Falha Uma Vez', chave: 'k-falha' }); assert.equal(r.j.status, 'success');
+  console.log('anti-duplicação ok — grupos criados neste trecho:', sockAtual.criados - criadosAntes, '(esperado 5)');
+  assert.equal(sockAtual.criados - criadosAntes, 5);
 
   console.log('\n✅ TODOS OS TESTES DO SIDECAR PASSARAM');
   gasSrv.close(); process.exit(0);

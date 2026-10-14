@@ -1407,6 +1407,65 @@ app.get('/api/grupo-convite', async (req, res) => {
 // Teto de participantes por vez: adicionar muita gente de uma vez é o que mais
 // derruba número — o resto entra pelo link de convite.
 const MAX_PARTICIPANTES_CRIACAO = 50;
+
+// ANTI-DUPLICAÇÃO: o mesmo pedido de criação pode chegar duas vezes (o UrlFetchApp
+// do Apps Script repete a chamada quando o Render demora, ou alguém clica de novo
+// depois de um erro de rede). Cada pedido traz uma "chave"; enquanto o primeiro
+// estiver em andamento ou tiver terminado há pouco, o repetido recebe o MESMO
+// resultado em vez de criar outro grupo. Sem chave, nome + participantes iguais
+// em poucos minutos também contam como repetição.
+const criacoesRecentes = new Map();      // chave -> { assinatura, ts, promessa }
+const JANELA_CHAVE_MS = 15 * 60 * 1000;
+const JANELA_REPETICAO_MS = 3 * 60 * 1000;
+
+async function criarGrupoCompleto({ nome, descricao, numeros, somenteAdminsEnviam, somenteAdminsEditam }) {
+    let grupo;
+    try {
+        grupo = await sock.groupCreate(nome, numeros.map(n => `${n}@s.whatsapp.net`));
+    } catch (e) {
+        if (!numeros.length) throw new Error('O WhatsApp exigiu pelo menos 1 participante. Adicione 1 pessoa (pode ser o seu número pessoal) e convide o resto pelo link. Detalhe: ' + e.message);
+        throw e;
+    }
+    const groupId = grupo.id;
+    cacheListaGrupos.ts = 0;   // a busca seguinte já enxerga o grupo novo
+    console.log(`🆕 Grupo criado: "${nome}" (${groupId}) com ${numeros.length} participante(s) pedidos.`);
+
+    // Ajustes opcionais: se um falhar o grupo já existe, então só avisa.
+    const avisos = [];
+    const tentar = async (rotulo, fn) => { try { await fn(); } catch (e) { avisos.push(`${rotulo}: ${e.message}`); } };
+    if (descricao) await tentar('Descrição', () => sock.groupUpdateDescription(groupId, descricao));
+    if (somenteAdminsEnviam) await tentar('Só admins enviam', () => sock.groupSettingUpdate(groupId, 'announcement'));
+    if (somenteAdminsEditam) await tentar('Só admins editam', () => sock.groupSettingUpdate(groupId, 'locked'));
+
+    let link = '';
+    await tentar('Link de convite', async () => {
+        const code = await sock.groupInviteCode(groupId);
+        if (code) link = 'https://chat.whatsapp.com/' + code;
+    });
+
+    // Quem não entrou costuma ser privacidade ("quem pode me adicionar").
+    let naoAdicionados = [];
+    await tentar('Conferência de membros', async () => {
+        const meta = await metadadosGrupo(groupId, true);
+        const dentro = new Set();
+        for (const p of (meta.participants || [])) {
+            const n = await resolverTelefone(p.phoneNumber || p.id, p.id);
+            if (n) dentro.add(n);
+        }
+        naoAdicionados = numeros.filter(n => !dentro.has(n));
+    });
+
+    return {
+        status: 'success',
+        groupId,
+        nome,
+        link,
+        adicionados: numeros.length - naoAdicionados.length,
+        naoAdicionados,
+        avisos
+    };
+}
+
 app.post('/api/criar-grupo', async (req, res) => {
     try {
         if (!isConnected) throw new Error('WhatsApp deslogado.');
@@ -1424,50 +1483,29 @@ app.post('/api/criar-grupo', async (req, res) => {
             throw new Error(`No máximo ${MAX_PARTICIPANTES_CRIACAO} participantes por vez. Convide o resto pelo link do grupo.`);
         }
 
-        let grupo;
-        try {
-            grupo = await sock.groupCreate(nome, numeros.map(n => `${n}@s.whatsapp.net`));
-        } catch (e) {
-            if (!numeros.length) throw new Error('O WhatsApp exigiu pelo menos 1 participante. Adicione 1 pessoa (pode ser o seu número pessoal) e convide o resto pelo link. Detalhe: ' + e.message);
-            throw e;
+        const agora = Date.now();
+        for (const [k, v] of criacoesRecentes) if (agora - v.ts > JANELA_CHAVE_MS) criacoesRecentes.delete(k);
+
+        const chave = String(b.chave || '').slice(0, 120) || `auto-${agora}-${Math.random()}`;
+        const assinatura = semAcento(nome) + '|' + numeros.slice().sort().join(',');
+        const anterior = criacoesRecentes.get(chave) ||
+            [...criacoesRecentes.values()].find(v => v.assinatura === assinatura && agora - v.ts < JANELA_REPETICAO_MS);
+        if (anterior) {
+            console.log(`♻️ Pedido repetido de criação de "${nome}" — devolvendo o grupo já criado, sem criar outro.`);
+            const r = await anterior.promessa;   // se o primeiro falhou, este falha igual
+            return res.json({ ...r, repetido: true });
         }
-        const groupId = grupo.id;
-        cacheListaGrupos.ts = 0;   // a busca seguinte já enxerga o grupo novo
 
-        // Ajustes opcionais: se um falhar o grupo já existe, então só avisa.
-        const avisos = [];
-        const tentar = async (rotulo, fn) => { try { await fn(); } catch (e) { avisos.push(`${rotulo}: ${e.message}`); } };
-        if (descricao) await tentar('Descrição', () => sock.groupUpdateDescription(groupId, descricao));
-        if (b.somenteAdminsEnviam) await tentar('Só admins enviam', () => sock.groupSettingUpdate(groupId, 'announcement'));
-        if (b.somenteAdminsEditam) await tentar('Só admins editam', () => sock.groupSettingUpdate(groupId, 'locked'));
+        const registro = {
+            assinatura,
+            ts: agora,
+            promessa: criarGrupoCompleto({ nome, descricao, numeros, somenteAdminsEnviam: !!b.somenteAdminsEnviam, somenteAdminsEditam: !!b.somenteAdminsEditam })
+        };
+        criacoesRecentes.set(chave, registro);
+        // Falhou: libera a chave para uma nova tentativa de verdade.
+        registro.promessa.catch(() => { if (criacoesRecentes.get(chave) === registro) criacoesRecentes.delete(chave); });
 
-        let link = '';
-        await tentar('Link de convite', async () => {
-            const code = await sock.groupInviteCode(groupId);
-            if (code) link = 'https://chat.whatsapp.com/' + code;
-        });
-
-        // Quem não entrou costuma ser privacidade ("quem pode me adicionar").
-        let naoAdicionados = [];
-        await tentar('Conferência de membros', async () => {
-            const meta = await metadadosGrupo(groupId, true);
-            const dentro = new Set();
-            for (const p of (meta.participants || [])) {
-                const n = await resolverTelefone(p.phoneNumber || p.id, p.id);
-                if (n) dentro.add(n);
-            }
-            naoAdicionados = numeros.filter(n => !dentro.has(n));
-        });
-
-        res.json({
-            status: 'success',
-            groupId,
-            nome,
-            link,
-            adicionados: numeros.length - naoAdicionados.length,
-            naoAdicionados,
-            avisos
-        });
+        res.json(await registro.promessa);
     } catch (error) {
         res.status(500).json({ status: 'error', message: error.message || String(error) });
     }
