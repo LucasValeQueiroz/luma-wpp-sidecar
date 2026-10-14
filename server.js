@@ -44,6 +44,7 @@
  *  MONGO_URI, API_SECRET (obrigatórias)
  *  ENVIO_* (opcionais — limites da fila; também ajustáveis pelo painel)
  *  META_* / APPS_SCRIPT_* (opcionais — só para o Embedded Signup)
+ *  WA_VERSION (opcional — força a versão do WhatsApp Web, ex.: 2.3000.1050340960)
  * =====================================================================
  */
 
@@ -53,7 +54,8 @@ const {
     DisconnectReason,
     initAuthCreds,
     BufferJSON,
-    downloadMediaMessage
+    downloadMediaMessage,
+    fetchLatestWaWebVersion
 } = require('@whiskeysockets/baileys');
 const { MongoClient, ObjectId } = require('mongodb');
 const qrcode = require('qrcode');
@@ -955,6 +957,45 @@ function encerrarSocketAntigo() {
     try { sock.end(undefined); } catch (e) { /* já estava fechado */ }
 }
 
+// ---------------------------------------------------------------------
+// VERSÃO DO WHATSAPP WEB
+// O Baileys traz embutida a versão do WhatsApp Web da época em que foi
+// publicado. Quando ela envelhece, o WhatsApp recusa a conexão com 405
+// antes mesmo de gerar o QR — e apagar a sessão não resolve. Por isso a
+// versão atual é lida de web.whatsapp.com e renovada a cada 6h (ou logo
+// após um 405). WA_VERSION força uma versão manualmente, se a busca falhar.
+// ---------------------------------------------------------------------
+const STATUS_VERSAO_RECUSADA = 405;
+const VERSAO_WA_CACHE_MS = 6 * 60 * 60 * 1000;
+let versaoWa = null;                // [2, 3000, N] — null = usa a embutida no Baileys
+let versaoWaEm = 0;
+
+function versaoWaManual() {
+    const partes = String(process.env.WA_VERSION || '').trim().split('.').map(Number);
+    return partes.length === 3 && partes.every(n => Number.isInteger(n) && n >= 0) ? partes : null;
+}
+
+async function obterVersaoWa() {
+    const manual = versaoWaManual();
+    if (manual) return manual;
+    if (versaoWa && Date.now() - versaoWaEm < VERSAO_WA_CACHE_MS) return versaoWa;
+
+    // fetchLatestWaWebVersion não lança erro: em falha devolve isLatest=false.
+    const r = await fetchLatestWaWebVersion({ signal: AbortSignal.timeout(10000) });
+    if (r && r.isLatest && Array.isArray(r.version)) {
+        if (!versaoWa || versaoWa.join('.') !== r.version.join('.')) {
+            console.log(`🌐 Versão do WhatsApp Web: ${r.version.join('.')}`);
+        }
+        versaoWa = r.version;
+        versaoWaEm = Date.now();
+    } else {
+        const motivo = r?.error?.message || String(r?.error || 'sem detalhes');
+        console.warn(`⚠️ Não consegui ler a versão atual do WhatsApp Web (${motivo}). ` +
+            (versaoWa ? 'Mantendo a última conhecida.' : 'Usando a embutida no Baileys.'));
+    }
+    return versaoWa;
+}
+
 function atrasoReconexao(statusCode) {
     if (statusCode === DisconnectReason.restartRequired) return 1000;
     if (statusCode === DisconnectReason.loggedOut) return 3000;
@@ -967,12 +1008,15 @@ function atrasoReconexao(statusCode) {
 
 async function conectarInterno() {
     const { state, saveCreds } = await useMongoDBAuthState(mongoCollection);
+    const versao = await obterVersaoWa();
 
     encerrarSocketAntigo();
     cacheGrupos.clear();
 
     sock = makeWASocket({
         auth: state,
+        // Só passa a versão quando houver uma: `version: undefined` apagaria o padrão do Baileys.
+        ...(versao ? { version: versao } : {}),
         // NUNCA imprimir o QR no terminal: os logs do Render ficam guardados e
         // quem tiver acesso a um print de log pareia o próprio aparelho na sua conta.
         printQRInTerminal: false,
@@ -1012,6 +1056,12 @@ async function conectarInterno() {
 
             const espera = atrasoReconexao(statusCode);
             console.log(`🔴 Conexão encerrada (Status: ${statusCode}). Deslogado: ${deslogado}. Reconectando em ${Math.round(espera / 1000)}s.`);
+
+            if (statusCode === STATUS_VERSAO_RECUSADA) {
+                // Versão recusada: na próxima tentativa busca a versão atual de novo.
+                versaoWaEm = 0;
+                console.log('🌐 405 = WhatsApp recusou a versão do cliente. A versão será buscada de novo.');
+            }
 
             if (deslogado) {
                 // Sessão inválida: limpa e reconecta para emitir um QR novo.
@@ -1063,7 +1113,11 @@ app.get('/api/qr', (req, res) => {
 
     const seg = inicioTentativaConexao ? Math.round((Date.now() - inicioTentativaConexao) / 1000) : 0;
     let msg = 'Aguarde, gerando QR Code...';
-    if (seg > 90) {
+    if (ultimoMotivoQueda === String(STATUS_VERSAO_RECUSADA)) {
+        // Apagar a sessão não resolve um 405 — o problema é a versão, não o pareamento.
+        msg = 'O WhatsApp recusou a versão do cliente (405). Buscando a versão atual e tentando de novo... ' +
+              'Se persistir, defina WA_VERSION no Render.';
+    } else if (seg > 90) {
         msg = `Tentando conectar há ${seg}s sem sucesso` +
               (ultimoMotivoQueda ? ` (última queda: ${ultimoMotivoQueda})` : '') +
               '. Use "Apagar sessão e gerar QR novo".';

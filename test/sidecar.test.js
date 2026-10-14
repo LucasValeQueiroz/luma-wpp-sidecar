@@ -35,7 +35,7 @@ function makeWASocket(opts) {
 }
 const origLoad = Module._load;
 Module._load = function (req, parent, isMain) {
-  if (req === '@whiskeysockets/baileys') return { ...real, default: makeWASocket, downloadMediaMessage: async () => Buffer.from('IMG') };
+  if (req === '@whiskeysockets/baileys') return { ...real, default: makeWASocket, downloadMediaMessage: async () => Buffer.from('IMG'), fetchLatestWaWebVersion: async () => ({ version: [2, 3000, 123], isLatest: true }) };
   if (req === 'mongodb') return fakeMongo;
   return origLoad.apply(this, arguments);
 };
@@ -59,6 +59,8 @@ async function esperar(cond, ms = 8000) { const t = Date.now(); while (Date.now(
   await srv._interno.startServer();
   await esperar(async () => srv._interno.estado().isConnected);
   console.log('conectado:', srv._interno.estado().isConnected);
+  // versão do WhatsApp Web buscada na hora (evita o 405 de versão velha)
+  assert.deepEqual(sockAtual.opts.version, [2, 3000, 123]);
 
   // 1) auth
   assert.equal((await get('/api/health', {})).code, 401);
