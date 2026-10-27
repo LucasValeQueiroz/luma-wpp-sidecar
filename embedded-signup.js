@@ -364,7 +364,7 @@ function paginaConectar() {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Conectar seu WhatsApp — Luma CRM</title>
+<title>Conectar seu WhatsApp — Lumairam Atendimento</title>
 <style>
   *{box-sizing:border-box}
   body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;
@@ -397,8 +397,8 @@ function paginaConectar() {
 </head>
 <body>
 <div class="card">
-  <h1>Conectar seu WhatsApp ao Luma CRM</h1>
-  <p class="sub">Sua empresa autoriza o Luma CRM a atender pelo seu número oficial.</p>
+  <h1>Conectar seu WhatsApp ao Lumairam Atendimento</h1>
+  <p class="sub">Sua empresa autoriza o Lumairam Atendimento a atender pelo seu número oficial do WhatsApp.</p>
 
   <div class="opcoes" role="radiogroup" aria-label="Como você usa o WhatsApp hoje">
     <label class="op">
@@ -423,9 +423,10 @@ function paginaConectar() {
   <div id="msg" class="msg" role="status"></div>
 
   <p class="rodape">
-    Lumairam Info Tech Dev · CNPJ 61.868.004/0001-80<br>
-    <a href="https://lumairam.com/politicadeprivacidade.html">Política de privacidade</a> ·
-    <a href="https://lumairam.com/exclusao-de-dados.html">Exclusão de dados</a>
+    Lumairam · LUCAS VALE QUEIROZ - ME · CNPJ 61.868.004/0001-80<br>
+    <a href="https://www.lumairam.com/politicadeprivacidade">Política de privacidade</a> ·
+    <a href="https://www.lumairam.com/termosdeuso">Termos de uso</a> ·
+    <a href="https://www.lumairam.com/exclusaodedados">Exclusão de dados</a>
   </p>
 </div>
 
@@ -509,7 +510,7 @@ function paginaConectar() {
           ? 'Pronto! Seu WhatsApp Business continua funcionando no celular, e o histórico começa a chegar nas próximas horas.'
           : 'Pronto! Seu número foi conectado. Nossa equipe vai confirmar a importação do histórico com você.', 'ok');
       } else {
-        aviso('Pronto! Sua conta foi conectada ao Luma CRM.', 'ok');
+        aviso('Pronto! Sua conta foi conectada ao Lumairam Atendimento.', 'ok');
       }
     })
     .catch(function () {
