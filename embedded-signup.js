@@ -66,6 +66,13 @@ const GAS_SECRET     = process.env.APPS_SCRIPT_SECRET || process.env.API_SECRET 
 
 const FEATURE_COEX = 'whatsapp_business_app_onboarding';
 
+// ES_SINCRONIZAR_NO_CRM=1: o sidecar NÃO pede contatos/histórico à Meta e deixa isso
+// para o CRM (SPEC-001 / ADR-004 do projeto 0110). A Meta só sincroniza UMA vez, e o
+// CRM precisa primeiro apontar os webhooks da conta para a instância certa
+// (override_callback_uri); se o sidecar pedisse antes, o histórico iria para o
+// callback padrão do app. Lida a cada requisição para mudar sem redeploy do código.
+const sincronizarNoCrm = () => process.env.ES_SINCRONIZAR_NO_CRM === '1';
+
 function jsonDoEnv(nome, padrao) {
   const bruto = process.env[nome];
   if (!bruto) return padrao;
@@ -172,7 +179,10 @@ router.post('/api/es/finalizar', express.json({ limit: '1mb' }), async (req, res
 
     // 4) Coexistence: sincroniza contatos e histórico (janela de 24h)
     //    Número novo: registra, se houver PIN configurado.
-    if (ehCoexistence) {
+    const delegada = ehCoexistence && sincronizarNoCrm();
+    if (delegada) {
+      etapas.syncContatos = etapas.syncHistorico = 'delegado ao CRM';
+    } else if (ehCoexistence) {
       if (phone_number_id) {
         etapas.syncContatos = await graphPost(`${phone_number_id}/smb_app_data`, token,
           { messaging_product: 'whatsapp', sync_type: 'smb_app_state_sync' })
@@ -198,6 +208,7 @@ router.post('/api/es/finalizar', express.json({ limit: '1mb' }), async (req, res
       phone_number_id: phone_number_id || null,
       business_id: business_id || null,
       coexistence: ehCoexistence,
+      sincronizacao: delegada ? 'delegada' : 'sidecar',
       modo: ehCoexistence ? 'coex' : 'novo',
       versao_signup: 'v4',
       graph_version: GRAPH_VERSION,
@@ -206,8 +217,9 @@ router.post('/api/es/finalizar', express.json({ limit: '1mb' }), async (req, res
       etapas,
       recebido_em: new Date().toISOString()
     };
+    let respostaCrm = null;
     etapas.appsScript = await avisarAppsScript(req, payload)
-      .then(() => 'ok')
+      .then((j) => { respostaCrm = j; return 'ok'; })
       .catch(async (e) => {
         const col = colecao(req, 'onboarding_pendente');
         if (col) {
@@ -224,7 +236,8 @@ router.post('/api/es/finalizar', express.json({ limit: '1mb' }), async (req, res
     res.json({
       ok: true,
       coexistence: ehCoexistence,
-      historico: String(etapas.syncHistorico || '').startsWith('ok'),
+      // Delegada: quem sabe se o histórico foi pedido é o CRM (campo historico da resposta).
+      historico: delegada ? !!(respostaCrm && respostaCrm.historico) : String(etapas.syncHistorico || '').startsWith('ok'),
       avisos: Object.entries(etapas)
         .filter(([, v]) => /falhou|pendente|pulado/.test(String(v)))
         .map(([k]) => k)
@@ -333,6 +346,7 @@ async function avisarAppsScript(req, payload) {
   try { j = JSON.parse(texto); } catch (e) { /* HTML = página de erro/login do Google */ }
   if (!j) throw new Error('Apps Script respondeu sem JSON (URL /exec correta? nova versão publicada?)');
   if (j.ok === false) throw new Error('Apps Script recusou: ' + (j.erro || 'motivo não informado'));
+  return j;
 }
 
 

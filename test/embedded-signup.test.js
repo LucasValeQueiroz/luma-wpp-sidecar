@@ -33,7 +33,7 @@ globalThis.fetch = async (url, opt = {}) => {
   // ---- dublê do Apps Script ----
   const gas = express(); gas.use(express.json());
   const recebidos = []; let gasFora = false;
-  gas.post('/exec', (req, res) => { if (gasFora) return res.status(500).send('fora'); recebidos.push(req.body); res.json({ ok: true }); });
+  gas.post('/exec', (req, res) => { if (gasFora) return res.status(500).send('fora'); recebidos.push(req.body); res.json({ ok: true, historico: req.body.sincronizacao === 'delegada' }); });
   const gasSrv = gas.listen(3988);
 
   const app = express(); app.use(express.json());
@@ -96,6 +96,21 @@ globalThis.fetch = async (url, opt = {}) => {
   assert.equal((await post('/api/es/finalizar', {})).code, 400);
   let ultimo = 0; for (let i = 0; i < 6; i++) ultimo = (await post('/api/es/finalizar', {})).code;
   console.log('6) erros: code inválido=500, sem code=400, excesso de tentativas=' + ultimo); assert.equal(ultimo, 429);
+
+  // 7) ES_SINCRONIZAR_NO_CRM=1 → o sidecar NÃO sincroniza; o CRM recebe 'delegada' e responde o histórico
+  process.env.ES_SINCRONIZAR_NO_CRM = '1';
+  chamadas.length = 0;
+  // outro IP: o teste 6 esgotou de propósito o limite de tentativas do IP local
+  r = await post('/api/es/finalizar', { code: 'CODE-OK', modo: 'coex', waba_id: 'W4', event: 'FINISH_WHATSAPP_BUSINESS_APP_ONBOARDING' }, { 'x-forwarded-for': '10.0.0.7' });
+  const g7 = recebidos[recebidos.length - 1];
+  console.log('7) sincronização delegada → chamadas:', chamadas.map(c => c.metodo + ' ' + c.caminho).join(' → '), '| CRM recebeu:', g7.sincronizacao, g7.etapas.syncHistorico, '| navegador historico:', r.j.historico);
+  assert.ok(!chamadas.some(c => c.caminho.endsWith('smb_app_data')), 'delegada: sidecar não sincroniza');
+  assert.ok(chamadas.some(c => c.caminho === 'W4/subscribed_apps'), 'continua assinando o app na WABA');
+  assert.equal(g7.sincronizacao, 'delegada'); assert.equal(g7.etapas.syncHistorico, 'delegado ao CRM');
+  assert.equal(r.j.ok, true); assert.equal(r.j.historico, true, 'navegador usa a resposta do CRM');
+  assert.ok(!r.j.avisos.includes('syncHistorico'), 'delegado não é aviso');
+  delete process.env.ES_SINCRONIZAR_NO_CRM;
+  assert.equal(recebidos[0].sincronizacao, 'sidecar', 'sem a variável o comportamento antigo continua');
 
   console.log('\n✅ TODOS OS TESTES DO EMBEDDED SIGNUP v4 PASSARAM');
   srv.close(); gasSrv.close(); process.exit(0);

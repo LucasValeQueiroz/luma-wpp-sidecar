@@ -91,6 +91,7 @@ mantém o auxiliar longe do banimento. A rota de envio recusa qualquer destino q
 | `META_ES_EXTRAS_COEX` / `META_ES_EXTRAS` | — | Opcional: o `extras` exato gerado pelo Embedded Signup Builder (JSON). Padrão Coexistence: `{"setup":{},"featureType":"whatsapp_business_app_onboarding"}`; número novo: `{}`. |
 | `META_REGISTER_PIN` | — | Opcional: PIN de 6 dígitos para registrar números novos automaticamente. |
 | `APPS_SCRIPT_URL` / `APPS_SCRIPT_SECRET` | — | Opcionais: vazio = a URL `/exec` sincronizada pelo CRM e a própria `API_SECRET`. |
+| `ES_SINCRONIZAR_NO_CRM` | — | `1` = o sidecar não pede contatos/histórico (`smb_app_data`); avisa o CRM com `sincronizacao: 'delegada'` e o CRM pede depois de apontar os webhooks da conta (override). A Meta só sincroniza uma vez. |
 | `GRAPH_VERSION` | — | Padrão `v25.0`. |
 
 Os limites da fila também são ajustados pelo painel do CRM (**Gestão de Grupos → Saída →
